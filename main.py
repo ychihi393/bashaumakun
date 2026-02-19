@@ -27,6 +27,8 @@ except Exception:
 
 DATA_PATH = Path("assets/data.json")
 SLACK_SELECTIONS_PATH = Path("assets/slack_selections.json")
+PROPERTY_NUMBERS_PATH = Path("assets/property_numbers.json")
+PROPERTY_NUMBER_START = 73  # 最初の物件番号 → "073"
 OUTPUT_ROOT = Path("output/投稿用出力")
 WORK_ROOT = OUTPUT_ROOT / "_work"
 ADOPTED_FOLDER = OUTPUT_ROOT / "採用"
@@ -38,8 +40,20 @@ POSTS_JSON_PATH = OUTPUT_ROOT / "投稿一覧.json"
 COPY_TXT_PATH = OUTPUT_ROOT / "コピペ用_投稿文.txt"
 COPY_MD_PATH = OUTPUT_ROOT / "コピペ用_投稿文.md"
 CLEAN_COPY_TXT_PATH = OUTPUT_ROOT / "コピペ専用_タイトルキャプション.txt"
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_COVER_PICK_MAX_IMAGES = int(os.getenv("POSTGEN_GEMINI_COVER_PICK_MAX_IMAGES", "10"))
+
+# 日本語フォント候補（太字優先）
+_FONT_CANDIDATES = [
+    r"C:\Windows\Fonts\MPLUS1p-Bold.ttf",
+    r"C:\Windows\Fonts\BIZUDGothic-Bold.ttc",
+    r"C:\Windows\Fonts\BIZ-UDGothicB.ttc",
+    r"C:\Windows\Fonts\meiryob.ttc",
+    r"C:\Windows\Fonts\meiryo.ttc",
+    r"C:\Windows\Fonts\YuGothB.ttc",
+    r"C:\Windows\Fonts\YuGothM.ttc",
+    r"C:\Windows\Fonts\msgothic.ttc",
+]
 
 
 def setup_logger() -> None:
@@ -264,12 +278,61 @@ def _upscale(im: Image.Image) -> Image.Image:
     return im.resize((int(w * 1.5), int(h * 1.5)), Image.Resampling.LANCZOS)
 
 
-def _draw_title(im: Image.Image, title: str) -> Image.Image:
-    out = im.copy()
-    draw = ImageDraw.Draw(out, "RGBA")
-    draw.rectangle([0, 0, out.width, 130], fill=(0, 0, 0, 110))
-    draw.text((24, 42), title[:60], font=ImageFont.load_default(), fill=(255, 255, 255, 255))
-    return out
+def _load_font(size: int) -> ImageFont.FreeTypeFont:
+    """日本語が使えるフォントをロードする。見つからなければデフォルト。"""
+    for path in _FONT_CANDIDATES:
+        if Path(path).exists():
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                continue
+    return ImageFont.load_default()
+
+
+def _draw_overlay(im: Image.Image, lines: List[str]) -> Image.Image:
+    """
+    画像下部に複数行テキストを重ねる。
+    - 半透明黒帯を敷いてから白文字で描画（影付き）
+    - lines: 表示したいテキストのリスト（最大3行）
+    """
+    out = im.copy().convert("RGBA")
+    w, h = out.size
+
+    lines = [str(l).strip() for l in lines if str(l).strip()][:3]
+    if not lines:
+        return out.convert("RGB")
+
+    sizes = [62, 54, 48]
+    line_gap = 14
+    pad_x, pad_bottom = 36, 44
+
+    # 各行の高さを計算して帯の高さを決める
+    fonts = [_load_font(sizes[i] if i < len(sizes) else 44) for i in range(len(lines))]
+    line_heights = []
+    for font, text in zip(fonts, lines):
+        dummy = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+        bb = dummy.textbbox((0, 0), text, font=font)
+        line_heights.append(bb[3] - bb[1])
+
+    total_text_h = sum(line_heights) + line_gap * (len(lines) - 1)
+    band_h = total_text_h + pad_bottom * 2
+
+    # 半透明帯
+    overlay = Image.new("RGBA", (w, band_h), (0, 0, 0, 0))
+    band_draw = ImageDraw.Draw(overlay)
+    band_draw.rectangle([0, 0, w, band_h], fill=(10, 10, 10, 175))
+    out.paste(overlay, (0, h - band_h), overlay)
+
+    draw = ImageDraw.Draw(out)
+    y = h - band_h + pad_bottom
+    for font, text, lh in zip(fonts, lines, line_heights):
+        # 影
+        draw.text((pad_x + 2, y + 2), text, font=font, fill=(0, 0, 0, 200))
+        # 本文
+        draw.text((pad_x, y), text, font=font, fill=(255, 255, 255, 255))
+        y += lh + line_gap
+
+    return out.convert("RGB")
 
 
 def _extract_json_block(text: str) -> Optional[Dict[str, Any]]:
@@ -292,20 +355,62 @@ def _extract_json_block(text: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+# ── 物件番号管理 ─────────────────────────────────────────────────────────────
+
+def load_property_numbers() -> Dict[str, str]:
+    """assets/property_numbers.json から property_id → "073" 形式のマッピングを読み込む。"""
+    if not PROPERTY_NUMBERS_PATH.exists():
+        return {}
+    try:
+        return json.loads(PROPERTY_NUMBERS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_property_numbers(mapping: Dict[str, str]) -> None:
+    PROPERTY_NUMBERS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PROPERTY_NUMBERS_PATH.write_text(
+        json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def assign_property_number(property_id: str, mapping: Dict[str, str]) -> str:
+    """
+    property_id に物件番号を割り当てる。
+    - 既に番号があればそれを返す（再実行しても変わらない）
+    - 新規なら既存の最大番号+1 を割り当て、mapping を更新する
+    - 番号は3桁ゼロ埋め文字列（例: "073"）
+    """
+    if property_id in mapping:
+        return mapping[property_id]
+    if mapping:
+        max_num = max((int(v) for v in mapping.values() if v.isdigit()), default=PROPERTY_NUMBER_START - 1)
+        next_num = max_num + 1
+    else:
+        next_num = PROPERTY_NUMBER_START
+    num_str = f"{next_num:03d}"
+    mapping[property_id] = num_str
+    return num_str
+
+
+# ── キャプション生成 ──────────────────────────────────────────────────────────
+
 def _fallback_title(record: Dict[str, Any]) -> str:
-    return f"{str(record.get('layout') or '間取り要確認')}｜{str(record.get('price') or '家賃要確認')}"
+    layout = str(record.get("layout") or "")
+    price = str(record.get("price") or "")
+    parts = [p for p in [layout, price] if p]
+    return "｜".join(parts) if parts else "物件情報"
 
 
-def _fallback_caption(record: Dict[str, Any], property_id: str) -> str:
-    station = str(record.get("station") or "").strip()
+def _fallback_caption(record: Dict[str, Any], prop_num: str) -> str:
     feats = [str(x).strip() for x in (record.get("features") or []) if str(x).strip()]
-    lines = "\n".join([f"- {x}" for x in feats[:4]]) if feats else "- 設備情報はお問い合わせください"
+    feat_lines = "\n".join([f"- {x}" for x in feats[:4]]) if feats else "- 設備情報はお問い合わせください"
     txt = (
-        "この条件、ちゃんと比べるとかなりアリです。\n"
-        f"{station}\n\n設備・条件:\n{lines}\n\n"
-        "図面と詳細を確認したい方は\n"
+        "この条件、ちゃんと比べるとかなりアリです。\n\n"
+        f"設備・条件:\n{feat_lines}\n\n"
+        "詳細が気になった方は\n"
         "プロフのリンクから\n"
-        f"「{property_id}」\n"
+        f"「{prop_num}」\n"
         "とだけLINEを送ってください。\n"
         "すぐに詳細をお送りします。\n\n"
         "#賃貸 #お部屋探し #一人暮らし #同棲 #物件紹介"
@@ -313,29 +418,47 @@ def _fallback_caption(record: Dict[str, Any], property_id: str) -> str:
     return sanitize_public_caption(txt)
 
 
-def _gemini_copy(record: Dict[str, Any], property_id: str) -> Dict[str, str]:
-    fallback = {"title": _fallback_title(record), "caption": _fallback_caption(record, property_id)}
+def _gemini_copy(record: Dict[str, Any], property_id: str, prop_num: str) -> Dict[str, str]:
+    fallback = {
+        "title": _fallback_title(record),
+        "caption": _fallback_caption(record, prop_num),
+        "overlay_line1": _fallback_title(record),
+        "overlay_line2": "",
+    }
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key or genai is None:
         return fallback
+
     payload = {
-        "id": property_id,
+        "prop_num": prop_num,
         "price": str(record.get("price") or ""),
         "layout": str(record.get("layout") or ""),
-        "station": str(record.get("station") or ""),
+        "area_hint": str(record.get("station") or ""),  # エリア参考（出力には駅名を書かせない）
         "features": [str(x) for x in (record.get("features") or [])],
         "is_new_building": bool(record.get("is_new_building")),
     }
     prompt = (
         "あなたは「SNSでバズる不動産アカウント」の専属コピーライターです。\n"
-        "目的は、LINE問い合わせ（CV）につなげること。\n"
-        "JSONのみ。キーは title, caption。\n"
-        "- title: 漢字/数字中心、縦棒｜で区切る\n"
-        "- caption: フック→説得→設備3-4点→締め→CTA→ハッシュタグ5個\n"
-        "CTAは必ず:\n図面と詳細を確認したい方は\nプロフのリンクから\n"
-        f"「{property_id}」\nとだけLINEを送ってください。\nすぐに詳細をお送りします。\n"
-        "禁止: URL、itandibb/bukkakun、業者情報、堅苦しい口調\n"
-        f"入力資料(JSON): {json.dumps(payload, ensure_ascii=False)}"
+        "目的: 読者に「詳細が気になる」と感じさせ、LINE問い合わせ（CV）につなげる。\n\n"
+        "JSONのみ出力。キーは title, caption, overlay_line1, overlay_line2。\n\n"
+        "【title】\n"
+        "- 漢字・数字中心、縦棒｜で区切る（例: 2LDK｜築浅｜南向き）\n"
+        "- 物件名・号室・駅名は書かない。エリア（区・市など）はOK\n"
+        "- 60文字以内\n\n"
+        "【caption】\n"
+        "- 構成: フック→物件の魅力（設備・条件3〜4点）→含みを持たせた締め→CTA→ハッシュタグ5個\n"
+        "- 物件名・号室・最寄り駅名は書かない。区・エリア・間取り・価格帯はOK\n"
+        "- 読者に「どこだろう？詳細が知りたい」と思わせる含みのある表現にする\n"
+        "- CTAは以下の文言で固定:\n"
+        "  詳細が気になった方は\n"
+        "  プロフのリンクから\n"
+        f"  「{prop_num}」\n"
+        "  とだけLINEを送ってください。\n"
+        "  すぐに詳細をお送りします。\n\n"
+        "【overlay_line1】画像に重ねる1行目テキスト（例: 2LDK｜◯万円台）20文字以内\n"
+        "【overlay_line2】画像に重ねる2行目テキスト（例: 駅名なし・エリアや設備の特徴）20文字以内\n\n"
+        "【禁止】URL、itandibb、bukkakun、業者情報、堅苦しい口調、物件名、号室、駅名\n\n"
+        f"入力資料(JSON):\n{json.dumps(payload, ensure_ascii=False)}"
     )
     try:
         client = genai.Client(api_key=api_key)
@@ -347,7 +470,9 @@ def _gemini_copy(record: Dict[str, Any], property_id: str) -> Dict[str, str]:
         caption = sanitize_public_caption(str(parsed.get("caption") or fallback["caption"]).strip())
         if len(caption) < 20:
             caption = fallback["caption"]
-        return {"title": title, "caption": caption}
+        overlay1 = str(parsed.get("overlay_line1") or fallback["overlay_line1"]).strip()[:24]
+        overlay2 = str(parsed.get("overlay_line2") or "").strip()[:24]
+        return {"title": title, "caption": caption, "overlay_line1": overlay1, "overlay_line2": overlay2}
     except Exception as e:
         logging.warning("[%s] Gemini copy fallback: %s", property_id, e.__class__.__name__)
         return fallback
@@ -393,7 +518,13 @@ def _save_property_outputs(record: Dict[str, Any], src_image: Path, copy_payload
         original = im.convert("RGB")
     upscaled = _upscale(original)
     resized = _fit_4x5(upscaled)
-    titled = _draw_title(resized, copy_payload["title"])
+
+    # 文字入れ: overlay_line1 / overlay_line2 を使う（なければ title を使う）
+    overlay_lines = [
+        copy_payload.get("overlay_line1") or copy_payload.get("title") or "",
+        copy_payload.get("overlay_line2") or "",
+    ]
+    titled = _draw_overlay(resized, overlay_lines)
 
     original.save(adopted_dir / "01_元画像.jpg", quality=95)
     upscaled.save(adopted_dir / "02_アップスケール済み.png")
@@ -442,16 +573,28 @@ def write_copy_outputs(rows: List[Dict[str, Any]]) -> None:
 
 
 def _upload_and_send_to_slack(done_rows: List[Dict[str, Any]]) -> None:
+    # ── Google Drive 初期化 ──────────────────────────────────────────────────
     try:
         from drive_uploader import create_run_folder, is_configured, upload_folder_and_get_link
-    except Exception:
+        drive_enabled = bool(is_configured and is_configured())
+    except Exception as e:
+        logging.warning("drive_uploader のインポートに失敗: %s", e)
+        drive_enabled = False
         create_run_folder = None
-        is_configured = None
         upload_folder_and_get_link = None
 
-    drive_enabled = bool(is_configured and is_configured())
-    drive_parent = create_run_folder(f"post_output_{datetime.now().strftime('%Y%m%d_%H%M%S')}") if drive_enabled and create_run_folder else None
+    if drive_enabled:
+        logging.info("[Drive] 有効: Google Driveアップロードを開始します")
+        drive_parent = create_run_folder(f"post_output_{datetime.now().strftime('%Y%m%d_%H%M%S')}") if create_run_folder else None
+        if drive_parent:
+            logging.info("[Drive] 実行フォルダ作成: folder_id=%s", drive_parent)
+        else:
+            logging.warning("[Drive] 実行フォルダの作成に失敗しました。物件ごとに直接アップロードします")
+    else:
+        drive_parent = None
+        logging.warning("[Drive] 無効: GOOGLE_DRIVE_CREDENTIALS_JSON が未設定または認証ファイルが見つかりません")
 
+    # ── Slack クライアント初期化 ─────────────────────────────────────────────
     slack_client = None
     slack_token = os.getenv("SLACK_BOT_TOKEN", "").strip()
     slack_channel = os.getenv("SLACK_CHANNEL", "").strip()
@@ -459,25 +602,41 @@ def _upload_and_send_to_slack(done_rows: List[Dict[str, Any]]) -> None:
         try:
             from slack_sdk import WebClient
             slack_client = WebClient(token=slack_token)
+            logging.info("[Slack] 通知クライアント初期化OK: channel=%s", slack_channel)
         except Exception as e:
-            logging.warning("Slack client init failed: %s", e)
+            logging.warning("[Slack] クライアント初期化に失敗: %s", e)
+    else:
+        logging.warning("[Slack] 通知スキップ: SLACK_BOT_TOKEN または SLACK_CHANNEL が未設定")
 
+    # ── 物件ごとにアップロード & 通知 ────────────────────────────────────────
     for row in done_rows:
         slug = str(row.get("slug") or "").strip()
+        prop_num = str(row.get("property_number") or "")
         if not slug:
             continue
         folder = ADOPTED_FOLDER / slug
         if not folder.is_dir():
+            logging.warning("[%s] 採用フォルダが見つかりません: %s", slug, folder)
             continue
 
+        # Drive アップロード
         drive_link = None
         if drive_enabled and upload_folder_and_get_link is not None:
-            drive_link = upload_folder_and_get_link(folder, slug, drive_parent)
+            logging.info("[%s] Driveアップロード中...", slug)
+            drive_link = upload_folder_and_get_link(folder, f"{prop_num}_{slug}" if prop_num else slug, drive_parent)
+            if drive_link:
+                logging.info("[%s] Driveアップロード完了: %s", slug, drive_link)
+            else:
+                logging.warning("[%s] Driveアップロード失敗（リンクなし）", slug)
 
+        # Slack 通知
         if slack_client is not None:
-            parts = []
             title = str(row.get("title") or "").strip()
             caption = sanitize_public_caption(str(row.get("caption") or "").strip())
+            num_label = f"物件番号: {prop_num}" if prop_num else ""
+            parts = []
+            if num_label:
+                parts.append(num_label)
             if title:
                 parts.append(f"【タイトル】\n{title}")
             if drive_link:
@@ -487,9 +646,9 @@ def _upload_and_send_to_slack(done_rows: List[Dict[str, Any]]) -> None:
             if parts:
                 try:
                     slack_client.chat_postMessage(channel=slack_channel, text="\n\n".join(parts))
-                    logging.info("[%s] Slack notification sent", slug)
+                    logging.info("[%s] Slack通知送信完了", slug)
                 except Exception as e:
-                    logging.warning("[%s] Slack notification failed: %s", slug, e)
+                    logging.warning("[%s] Slack通知送信失敗: %s", slug, e)
 
 
 def main() -> None:
@@ -511,6 +670,9 @@ def main() -> None:
             logging.error("Slack手動選定が未完了です。先に slack_selector.py を実行してください。未選定=%d件", len(missing))
             raise SystemExit(1)
 
+    # 物件番号マッピングを読み込む（複数回実行しても番号が変わらない）
+    prop_numbers = load_property_numbers()
+
     done_rows: List[Dict[str, Any]] = []
     failed: List[Dict[str, str]] = []
     rejected: List[str] = []
@@ -526,20 +688,30 @@ def main() -> None:
                 f"property_id: {rid}\nreason: selected as rejected(ボツ) in Slack\n",
                 encoding="utf-8-sig",
             )
-            logging.info("[%s] skipped because rejected(ボツ) was selected in Slack", rid)
+            logging.info("[%s] ボツ判定 → ボツフォルダへ", rid)
             continue
+
+        # ボツ以外のみ物件番号を割り当てる
+        prop_num = assign_property_number(rid, prop_numbers)
+        logging.info("[%s] 物件番号: %s", rid, prop_num)
+
         try:
             src, chosen = _pick_source_image(rec, slack_idx)
             if src is None:
                 raise FileNotFoundError("ローカル画像が見つかりません")
-            copy_payload = _gemini_copy(rec, rid)
+            copy_payload = _gemini_copy(rec, rid, prop_num)
             row = _save_property_outputs(rec, src, copy_payload)
             row["selected_index"] = chosen
+            row["property_number"] = prop_num
             done_rows.append(row)
-            logging.info("[%s] processed", rid)
+            logging.info("[%s] 処理完了 (物件番号=%s)", rid, prop_num)
         except Exception as e:
             failed.append({"id": rid, "error": str(e)})
             logging.exception("[%s] 処理失敗: %s", rid, e)
+
+    # 物件番号を保存（次回実行時に引き継がれる）
+    save_property_numbers(prop_numbers)
+    logging.info("物件番号マッピングを保存: %s", PROPERTY_NUMBERS_PATH)
 
     if done_rows:
         write_copy_outputs(done_rows)
