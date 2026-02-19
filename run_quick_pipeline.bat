@@ -1,0 +1,16 @@
+@echo off
+setlocal
+chcp 65001 >nul
+set PYTHONUTF8=1
+set PYTHONIOENCODING=utf-8
+cd /d "%~dp0"
+
+set ITANJI_VIDEO_MAX_PAGES=2
+set ITANJI_VIDEO_MAX_PROPERTIES=5
+
+echo Quick mode:
+echo   ITANJI_VIDEO_MAX_PAGES=%ITANJI_VIDEO_MAX_PAGES%
+echo   ITANJI_VIDEO_MAX_PROPERTIES=%ITANJI_VIDEO_MAX_PROPERTIES%
+
+call run_full_pipeline.bat
+exit /b %ERRORLEVEL%

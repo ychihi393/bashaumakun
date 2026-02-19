@@ -1,0 +1,37 @@
+# 認証・シークレット（絶対にコミットしない）
+.env
+*credentials*.json
+*service_account*.json
+*secret*.json
+
+# パイプライン出力（大容量）
+output/
+assets/data.json
+assets/slack_selections.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# モデルファイル（大容量）
+*.pb
+*.caffemodel
+*.prototxt
+
+# エディタ
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
