@@ -1,3 +1,15 @@
+"""
+パイプライン出力をリセットする。
+
+削除対象:
+  - assets/data.json          （スクレイピング結果）
+  - output/投稿用出力/         （生成画像・テキスト）
+
+保持するもの（テスト繰り返しに必要なため削除しない）:
+  - output/itanji_video/saved_images/  （ダウンロード済み画像）
+  - assets/property_numbers.json       （物件番号の連番）
+  - assets/slack_selections.json       （Slack選定結果）
+"""
 from pathlib import Path
 import shutil
 
@@ -19,8 +31,12 @@ def remove_dir(path: Path) -> None:
 
 
 def main() -> None:
+    # スクレイピング結果（次のスクレイピングで上書きされる）
     remove_file(Path("assets/data.json"))
-    remove_dir(Path("output"))
+
+    # 生成出力のみ削除（ダウンロード済み画像は保持）
+    remove_dir(Path("output/投稿用出力"))
+
     print("clean_done")
 
 

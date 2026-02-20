@@ -1,0 +1,895 @@
+     1→import json
+     2→import os
+     3→import re
+     4→import tempfile
+     5→import time
+     6→from dataclasses import dataclass
+     7→from datetime import datetime
+     8→from pathlib import Path
+     9→from typing import Any, Dict, List, Optional, Set, Tuple
+    10→
+    11→import cv2
+    12→import numpy as np
+    13→import pandas as pd
+    14→import requests
+    15→from bs4 import BeautifulSoup
+    16→from playwright.sync_api import Page, sync_playwright
+    17→
+    18→import scrape_itanji as base
+    19→
+    20→try:
+    21→    from google import genai
+    22→except Exception:
+    23→    genai = None
+    24→
+    25→TOP_URL = "https://bukkakun.com/"
+    26→LIST_SEARCH_URL = "https://itandibb.com/rent_rooms/list"
+    27→OUTPUT_DIR = Path("output/itanji_video")
+    28→OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    29→OUTPUT_DATA_PATH = Path("assets/data.json")
+    30→SEEN_URLS_PATH = OUTPUT_DIR / "seen_detail_urls.json"
+    31→SAVED_IMAGES_DIR = OUTPUT_DIR / "saved_images"
+    32→
+    33→TARGET_WARDS = ["北区", "板橋区", "練馬区", "足立区", "葛飾区", "江戸川区"]
+    34→TARGET_CITIES_RAW = [
+    35→    "立川市", "三鷹市", "武蔵野市", "府中市", "町田市", "調布市", "小金井市", "小平市",
+    36→    "東村山市", "国分寺市", "国立市", "福生市", "東大和市", "日野市", "東久留米市", "西東京市",
+    37→]
+    38→AREA_FALLBACK_MAP = {}
+    39→TARGET_FEATURES = ["バストイレ別", "温水洗浄便座", "独立洗面台"]
+    40→
+    41→MAIN_STATIONS = ["新宿駅", "渋谷駅", "池袋駅", "東京駅", "品川駅", "大手町駅", "飯田橋駅"]
+    42→
+    43→MAX_PAGES = int(os.getenv("ITANJI_VIDEO_MAX_PAGES", "80"))
+    44→MAX_PROPERTIES = int(os.getenv("ITANJI_VIDEO_MAX_PROPERTIES", "120"))
+    45→HEADLESS = os.getenv("ITANJI_VIDEO_HEADLESS", "0").lower() in ("1", "true", "yes", "on")
+    46→HTTP_TIMEOUT = int(os.getenv("ITANJI_VIDEO_HTTP_TIMEOUT", "12"))
+    47→MIN_IMAGES = int(os.getenv("ITANJI_VIDEO_MIN_IMAGES", "7"))
+    48→SAVE_REVIEW_IMAGES = os.getenv("ITANJI_VIDEO_SAVE_IMAGES", "1").lower() in ("1", "true", "yes", "on")
+    49→UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36"
+    50→
+    51→
+    52→@dataclass
+    53→class RouteCheck:
+    54→    destination: str
+    55→    minutes: Optional[int]
+    56→    transfers: Optional[int]
+    57→    ok: bool
+    58→    source: str
+    59→
+    60→
+    61→@dataclass
+    62→class ImageQuality:
+    63→    index: int
+    64→    score: float
+    65→    brightness: float
+    66→    white_ratio: float
+    67→    floor_open_ratio: float
+    68→    room_likeness: float = 0.5  # 上部エッジ多め＝部屋らしさ
+    69→    close_up_penalty: float = 0.0  # 接写・単体物っぽいときのペナルティ
+    70→
+    71→
+    72→def log(msg: str) -> None:
+    73→    ts = datetime.now().strftime("%H:%M:%S")
+    74→    print(f"[{ts}] {msg}")
+    75→
+    76→
+    77→def normalize_area_names() -> List[str]:
+    78→    names: List[str] = []
+    79→    for city in TARGET_CITIES_RAW:
+    80→        names.append(city)
+    81→        for alt in AREA_FALLBACK_MAP.get(city, []):
+    82→            if alt not in names:
+    83→                names.append(alt)
+    84→    for ward in TARGET_WARDS:
+    85→        if ward not in names:
+    86→            names.append(ward)
+    87→    return names
+    88→
+    89→
+    90→def safe_click(page: Page, selectors: List[str], step_name: str) -> bool:
+    91→    for sel in selectors:
+    92→        try:
+    93→            loc = page.locator(sel)
+    94→            if loc.count() > 0:
+    95→                loc.first.click(timeout=3000)
+    96→                return True
+    97→        except Exception:
+    98→            continue
+    99→    log(f"[WARN] click failed: {step_name}")
+   100→    return False
+   101→
+   102→
+   103→def check_by_text(page: Page, text: str) -> bool:
+   104→    selectors = [
+   105→        f'label:has-text("{text}")',
+   106→        f'button:has-text("{text}")',
+   107→        f'div:has-text("{text}")',
+   108→        f'span:has-text("{text}")',
+   109→        f'p:has-text("{text}")',
+   110→    ]
+   111→    for sel in selectors:
+   112→        try:
+   113→            loc = page.locator(sel)
+   114→            if loc.count() == 0:
+   115→                continue
+   116→            loc.first.click(timeout=2500)
+   117→            page.wait_for_timeout(250)
+   118→            return True
+   119→        except Exception:
+   120→            continue
+   121→    return False
+   122→
+   123→
+   124→def close_area_modal_if_open(page: Page) -> None:
+   125→    # Some UI flows keep an area drawer/modal open after "決定".
+   126→    # Close it so subsequent controls are clickable.
+   127→    close_selectors = [
+   128→        'button:has(.itandi-bb-ui__CloseButton__Icon)',
+   129→        'button:has(svg.itandi-bb-ui__CloseButton__Icon)',
+   130→        'button[aria-label="閉じる"]',
+   131→        'button[aria-label="close"]',
+   132→    ]
+   133→    for sel in close_selectors:
+   134→        try:
+   135→            loc = page.locator(sel)
+   136→            if loc.count() > 0:
+   137→                loc.first.click(timeout=2000)
+   138→                page.wait_for_timeout(400)
+   139→                log("[OK] 所在地モーダルを閉じました")
+   140→                return
+   141→        except Exception:
+   142→            continue
+   143→    try:
+   144→        page.keyboard.press("Escape")
+   145→        page.wait_for_timeout(300)
+   146→    except Exception:
+   147→        pass
+   148→
+   149→
+   150→def click_search_submit(page: Page) -> bool:
+   151→    selectors = [
+   152→        'button.ListSearchButton[type="submit"]',
+   153→        'button:has-text("検索")[type="submit"]',
+   154→        'button:has-text("検索")',
+   155→        'input[type="submit"][value*="検索"]',
+   156→    ]
+   157→    if safe_click(page, selectors, "検索実行"):
+   158→        return True
+   159→
+   160→    # JS fallback for cases where overlay blocks normal click handling.
+   161→    try:
+   162→        ok = page.evaluate(
+   163→            """
+   164→            () => {
+   165→              const nodes = Array.from(document.querySelectorAll('button, input[type="submit"]'));
+   166→              const target = nodes.find((el) => {
+   167→                const txt = (el.innerText || el.textContent || el.value || "").trim();
+   168→                return txt.includes("検索");
+   169→              });
+   170→              if (!target) return false;
+   171→              target.click();
+   172→              return true;
+   173→            }
+   174→            """
+   175→        )
+   176→        if ok:
+   177→            log("[OK] 検索実行 (js fallback)")
+   178→            return True
+   179→    except Exception:
+   180→        pass
+   181→    log("[WARN] click failed: 検索実行 (all fallbacks)")
+   182→    return False
+   183→
+   184→
+   185→def apply_search_filters(page: Page) -> bool:
+   186→    log("検索条件を適用します")
+   187→    page.goto(LIST_SEARCH_URL, wait_until="load", timeout=60000)
+   188→    page.wait_for_timeout(1200)
+   189→
+   190→    if not safe_click(page, ['button:has-text("所在地で絞り込み")', 'button:has(div:has-text("所在地で絞り込み"))'], "所在地で絞り込み"):
+   191→        return False
+   192→    page.wait_for_timeout(700)
+   193→
+   194→    check_by_text(page, "東京都")
+   195→    page.wait_for_timeout(500)
+   196→
+   197→    ok = 0
+   198→    ng = 0
+   199→    for area in normalize_area_names():
+   200→        if check_by_text(page, area):
+   201→            ok += 1
+   202→        else:
+   203→            ng += 1
+   204→            log(f"[WARN] area not found in UI: {area}")
+   205→    log(f"[INFO] area select result: ok={ok}, not_found={ng}")
+   206→
+   207→    if not safe_click(page, ['button:has-text("決定")', 'button:has(div:has-text("決定"))'], "所在地の決定"):
+   208→        check_by_text(page, "決定")
+   209→    page.wait_for_timeout(900)
+   210→    close_area_modal_if_open(page)
+   211→
+   212→    if not check_by_text(page, "可能"):
+   213→        log("[WARN] 広告掲載可能(可能)の選択に失敗")
+   214→
+   215→    try:
+   216→        page.select_option('select[name="rent:lteq"]', value="10")
+   217→        log("[OK] rent:lteq=10")
+   218→    except Exception:
+   219→        try:
+   220→            page.locator('input[name="rent:lteq"]').first.fill("10")
+   221→            log("[OK] rent:lteq=10 (input fill)")
+   222→        except Exception:
+   223→            log("[WARN] rent:lteq=10 の設定に失敗")
+   224→
+   225→    try:
+   226→        page.select_option('select[name="offer_conditions_updated_at:gteq"]', value="1")
+   227→        log("[OK] offer_conditions_updated_at:gteq=1")
+   228→    except Exception:
+   229→        log("[WARN] offer_conditions_updated_at:gteq の設定に失敗")
+   230→
+   231→    try:
+   232→        page.select_option('select[name="building_age:lteq"]', value="15")
+   233→        log("[OK] building_age:lteq=15")
+   234→    except Exception:
+   235→        try:
+   236→            page.locator('input[name="building_age:lteq"]').first.fill("15")
+   237→            log("[OK] building_age:lteq=15 (input fill)")
+   238→        except Exception:
+   239→            log("[WARN] building_age:lteq=15 の設定に失敗")
+   240→
+   241→    if not click_search_submit(page):
+   242→        return False
+   243→
+   244→    page.wait_for_timeout(2200)
+   245→    log("[OK] 検索条件の適用が完了")
+   246→    return True
+   247→
+   248→
+   249→def extract_cards_from_page(page: Page) -> List[Dict[str, Any]]:
+   250→    payload = page.evaluate(
+   251→        """
+   252→        () => {
+   253→          const cardSelectors = [
+   254→            "div.itandi-bb-ui__Box",
+   255→            "div[class*='itandi-bb-ui__Box']",
+   256→            "[data-testid='property-card']",
+   257→            ".property-card",
+   258→            "a[href*='/rent_rooms/']"
+   259→          ];
+   260→          let cards = [];
+   261→          for (const sel of cardSelectors) {
+   262→            const found = Array.from(document.querySelectorAll(sel));
+   263→            if (found.length > 0) { cards = found; break; }
+   264→          }
+   265→          const textOf = (el) => ((el?.innerText || el?.textContent || "").trim());
+   266→          return cards.map((card) => {
+   267→            let href = "";
+   268→            try {
+   269→              if (card.matches && card.matches("a[href*='/rent_rooms/']")) href = card.getAttribute("href") || "";
+   270→            } catch {}
+   271→            if (!href) {
+   272→              const link = card.querySelector("a[href*='/rent_rooms/']");
+   273→              href = link ? (link.getAttribute("href") || "") : "";
+   274→            }
+   275→            if (!href) {
+   276→              const linkAny = card.querySelector("a[href]");
+   277→              href = linkAny ? (linkAny.getAttribute("href") || "") : "";
+   278→            }
+   279→            if (!href) {
+   280→              href = card.getAttribute("data-href") || card.getAttribute("href") || "";
+   281→            }
+   282→            const cardText = textOf(card);
+   283→            const statusTexts = Array.from(
+   284→              card.querySelectorAll("div.itandi-bb-ui__Flex, p, span")
+   285→            ).map((el) => textOf(el)).filter(Boolean);
+   286→            let imageCount = null;
+   287→            const direct = cardText.match(/(\\d+)\\s*枚/);
+   288→            if (direct) imageCount = Number.parseInt(direct[1], 10);
+   289→            if (imageCount === null) {
+   290→              for (const t of statusTexts) {
+   291→                const m = t.match(/(\\d+)\\s*枚/);
+   292→                if (m) { imageCount = Number.parseInt(m[1], 10); break; }
+   293→              }
+   294→            }
+   295→            return { href, cardText, statusTexts, imageCount };
+   296→          });
+   297→        }
+   298→        """
+   299→    )
+   300→    return payload or []
+   301→
+   302→
+   303→def to_absolute_url(href: str) -> str:
+   304→    href = (href or "").strip()
+   305→    if not href:
+   306→        return ""
+   307→    return href if href.startswith("http") else f"https://itandibb.com{href}"
+   308→
+   309→
+   310→def load_seen_urls() -> Set[str]:
+   311→    if not SEEN_URLS_PATH.exists():
+   312→        return set()
+   313→    try:
+   314→        with SEEN_URLS_PATH.open("r", encoding="utf-8") as f:
+   315→            data = json.load(f)
+   316→        if isinstance(data, list):
+   317→            return {str(x).strip() for x in data if str(x).strip()}
+   318→    except Exception:
+   319→        pass
+   320→    return set()
+   321→
+   322→
+   323→def save_seen_urls(urls: Set[str]) -> None:
+   324→    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+   325→    with SEEN_URLS_PATH.open("w", encoding="utf-8") as f:
+   326→        json.dump(sorted(urls), f, ensure_ascii=False, indent=2)
+   327→
+   328→
+   329→def image_ext_from_url(url: str) -> str:
+   330→    clean = (url or "").split("?", 1)[0].lower()
+   331→    ext = Path(clean).suffix
+   332→    if ext in {".jpg", ".jpeg", ".png", ".webp"}:
+   333→        return ext
+   334→    return ".jpg"
+   335→
+   336→
+   337→def save_record_images(records: List[Dict[str, Any]], label: str) -> int:
+   338→    if not SAVE_REVIEW_IMAGES:
+   339→        return 0
+   340→    saved = 0
+   341→    label_dir = SAVED_IMAGES_DIR / label
+   342→    label_dir.mkdir(parents=True, exist_ok=True)
+   343→
+   344→    for rec in records:
+   345→        rid = str(rec.get("id") or "").strip()
+   346→        if not rid:
+   347→            continue
+   348→        rec_dir = label_dir / rid
+   349→        rec_dir.mkdir(parents=True, exist_ok=True)
+   350→        for idx, img_url in enumerate(rec.get("images") or [], start=1):
+   351→            if not str(img_url).startswith("http"):
+   352→                continue
+   353→            ext = image_ext_from_url(str(img_url))
+   354→            dst = rec_dir / f"{idx:02d}{ext}"
+   355→            if dst.exists() and dst.stat().st_size > 0:
+   356→                continue
+   357→            raw = fetch_image_bytes(str(img_url))
+   358→            if not raw:
+   359→                continue
+   360→            dst.write_bytes(raw)
+   361→            saved += 1
+   362→    return saved
+   363→
+   364→
+   365→def collect_filtered_urls(page: Page) -> List[str]:
+   366→    seen = set()
+   367→    filtered_urls: List[str] = []
+   368→    page_no = 1
+   369→    stats = {
+   370→        "cards_total": 0,
+   371→        "no_url": 0,
+   372→        "dup": 0,
+   373→        "status_reject": 0,
+   374→        "image_reject": 0,
+   375→        "kept": 0,
+   376→    }
+   377→    ng_status_re = re.compile(r"(申し込みあり|申込あり|先行申込|申込受付終了|申込済|成約済)")
+   378→    positive_status_re = re.compile(r"(募集中|空室|募集)")
+   379→
+   380→    while page_no <= MAX_PAGES:
+   381→        cards = extract_cards_from_page(page)
+   382→        log(f"ページ{page_no}: cards={len(cards)}")
+   383→        stats["cards_total"] += len(cards)
+   384→
+   385→        for card in cards:
+   386→            url = to_absolute_url(card.get("href") or "")
+   387→            if not url:
+   388→                stats["no_url"] += 1
+   389→                continue
+   390→            if "/rent_rooms/" not in url:
+   391→                stats["no_url"] += 1
+   392→                continue
+   393→            if url in seen:
+   394→                stats["dup"] += 1
+   395→                continue
+   396→            seen.add(url)
+   397→
+   398→            all_text = "\n".join([(card.get("cardText") or "")] + (card.get("statusTexts") or []))
+   399→            # Reject only explicit negative statuses; do not reject generic "申込" wording.
+   400→            if ng_status_re.search(all_text):
+   401→                stats["status_reject"] += 1
+   402→                continue
+   403→            if not positive_status_re.search(all_text) and "募集終了" in all_text:
+   404→                stats["status_reject"] += 1
+   405→                continue
+   406→
+   407→            image_count = card.get("imageCount")
+   408→            if image_count is not None:
+   409→                try:
+   410→                    if int(image_count) < MIN_IMAGES:
+   411→                        stats["image_reject"] += 1
+   412→                        continue
+   413→                except Exception:
+   414→                    pass
+   415→
+   416→            filtered_urls.append(url)
+   417→            stats["kept"] += 1
+   418→            if 0 < MAX_PROPERTIES <= len(filtered_urls):
+   419→                log(
+   420→                    f"[INFO] filter stats: total={stats['cards_total']}, no_url={stats['no_url']}, dup={stats['dup']}, "
+   421→                    f"status_reject={stats['status_reject']}, image_reject={stats['image_reject']}, kept={stats['kept']}"
+   422→                )
+   423→                return filtered_urls
+   424→
+   425→        try:
+   426→            next_btn = page.locator('button:has-text("次へ"), a:has-text("次へ"), [data-testid="next-page"]').first
+   427→            if next_btn.count() == 0 or next_btn.is_disabled():
+   428→                break
+   429→            next_btn.click(timeout=4000)
+   430→            page.wait_for_timeout(1200)
+   431→            page_no += 1
+   432→        except Exception:
+   433→            break
+   434→
+   435→    log(
+   436→        f"[INFO] filter stats: total={stats['cards_total']}, no_url={stats['no_url']}, dup={stats['dup']}, "
+   437→        f"status_reject={stats['status_reject']}, image_reject={stats['image_reject']}, kept={stats['kept']}, min_images={MIN_IMAGES}"
+   438→    )
+   439→    return filtered_urls
+   440→
+   441→
+   442→def format_price(rent_value: Any) -> str:
+   443→    text = str(rent_value or "").strip()
+   444→    if not text:
+   445→        return ""
+   446→
+   447→    m_man = re.search(r"([0-9]+(?:\\.[0-9]+)?)\\s*万", text)
+   448→    if m_man:
+   449→        num = float(m_man.group(1))
+   450→        return f"{int(num)}万円" if abs(num - int(num)) < 1e-9 else f"{num:.1f}万円"
+   451→
+   452→    m_yen = re.search(r"([0-9][0-9,]*)\\s*円", text)
+   453→    if not m_yen:
+   454→        m_yen = re.search(r"([0-9][0-9,]*)", text)
+   455→    if not m_yen:
+   456→        return text
+   457→
+   458→    yen = int(m_yen.group(1).replace(",", ""))
+   459→    man = yen / 10000.0
+   460→    return f"{int(man)}万円" if yen % 10000 == 0 else f"{man:.1f}万円"
+   461→
+   462→
+   463→def is_new_building(detail: Dict[str, Any]) -> bool:
+   464→    built = str(detail.get("built_date") or "")
+   465→    if "新築" in built:
+   466→        return True
+   467→    if "築0年" in built:
+   468→        return True
+   469→    year_match = re.search(r"(20\\d{2}|19\\d{2})年", built)
+   470→    if year_match:
+   471→        y = int(year_match.group(1))
+   472→        return y >= datetime.now().year
+   473→    return False
+   474→
+   475→
+   476→def fetch_image_bytes(url: str) -> Optional[bytes]:
+   477→    try:
+   478→        r = requests.get(url, timeout=HTTP_TIMEOUT, headers={"User-Agent": UA})
+   479→        r.raise_for_status()
+   480→        return r.content
+   481→    except Exception:
+   482→        return None
+   483→
+   484→
+   485→def evaluate_image_quality(img_bgr: np.ndarray, index: int) -> ImageQuality:
+   486→    """
+   487→    洋室・リビングなど床面積が広く見える画像を高スコアに。
+   488→    エアコン・シューズボックス・収納のみの接写は低スコア（room_likeness / close_up_penalty で調整）。
+   489→    """
+   490→    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+   491→    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+   492→    h, w = hsv.shape[:2]
+   493→    v = hsv[:, :, 2]
+   494→    s = hsv[:, :, 1]
+   495→
+   496→    brightness = float(np.mean(v) / 255.0)
+   497→    white_ratio = float(np.mean((s < 45) & (v > 170)))
+   498→
+   499→    bottom = hsv[int(h * 0.45) :, :, :]
+   500→    floor_open_ratio = float(np.mean((bottom[:, :, 1] < 65) & (bottom[:, :, 2] > 95))) if bottom.size else 0.0
+   501→
+   502→    # 部屋らしさ: 上部（壁・天井）にエッジが多く、下部（床）は少ない＝広い部屋の遠景
+   503→    edges = cv2.Canny(gray, 50, 150)
+   504→    top_half = edges[: int(h * 0.5), :]
+   505→    bottom_half = edges[int(h * 0.5) :, :]
+   506→    edge_top = float(np.sum(top_half > 0)) / max(1, top_half.size)
+   507→    edge_bottom = float(np.sum(bottom_half > 0)) / max(1, bottom_half.size)
+   508→    if edge_bottom > 1e-6:
+   509→        room_likeness = min(1.0, edge_top / edge_bottom)
+   510→    else:
+   511→        room_likeness = 0.7 if edge_top > 0.01 else 0.5
+   512→
+   513→    # 接写・単体物ペナルティ: 中央がほぼ白一色で全体の明度分散が小さい（エアコン・シューズボックス等）
+   514→    center_y1, center_y2 = int(h * 0.33), int(h * 0.66)
+   515→    center_x1, center_x2 = int(w * 0.33), int(w * 0.66)
+   516→    center_region = v[center_y1:center_y2, center_x1:center_x2]
+   517→    center_white = float(np.mean((s[center_y1:center_y2, center_x1:center_x2] < 50) & (center_region > 180)))
+   518→    v_std = float(np.std(v))
+   519→
+   520→    # エアコン接写追加チェック:
+   521→    #   - 上部40%が白く均一 (エアコン本体が上に据付)
+   522→    #   - 全体のエッジ密度が低い (複雑な構造物がない)
+   523→    #   - 床が見えない (floor_open_ratio が低い)
+   524→    top_region_v = v[:int(h * 0.40), :]
+   525→    top_region_s = s[:int(h * 0.40), :]
+   526→    top_white_uniform = float(np.mean((top_region_s < 45) & (top_region_v > 175)))
+   527→    overall_edge_density = float(np.mean(edges > 0))
+   528→    ac_close_up = (top_white_uniform > 0.50 and overall_edge_density < 0.10 and floor_open_ratio < 0.15)
+   529→
+   530→    if ac_close_up:
+   531→        close_up_penalty = 0.45
+   532→    elif center_white > 0.75 and v_std < 35:
+   533→        close_up_penalty = 0.35
+   534→    elif center_white > 0.65 and v_std < 50:
+   535→        close_up_penalty = 0.15
+   536→    else:
+   537→        close_up_penalty = 0.0
+   538→
+   539→    # スコア: 床面積が広く見える（floor_open_ratio + room_likeness）を重視し、白一色接写を下げる
+   540→    score = (
+   541→        brightness * 0.15
+   542→        + white_ratio * 0.25
+   543→        + floor_open_ratio * 0.35
+   544→        + room_likeness * 0.25
+   545→        - close_up_penalty
+   546→    )
+   547→    score = max(0.0, min(1.0, score))
+   548→    return ImageQuality(
+   549→        index=index,
+   550→        score=score,
+   551→        brightness=brightness,
+   552→        white_ratio=white_ratio,
+   553→        floor_open_ratio=floor_open_ratio,
+   554→        room_likeness=room_likeness,
+   555→        close_up_penalty=close_up_penalty,
+   556→    )
+   557→
+   558→
+   559→def pick_cover_index(image_urls: List[str]) -> Tuple[int, List[Dict[str, Any]]]:
+   560→    metrics: List[ImageQuality] = []
+   561→    for i, url in enumerate(image_urls):
+   562→        raw = fetch_image_bytes(url)
+   563→        if not raw:
+   564→            continue
+   565→        arr = np.frombuffer(raw, dtype=np.uint8)
+   566→        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+   567→        if img is None:
+   568→            continue
+   569→        metrics.append(evaluate_image_quality(img, i))
+   570→
+   571→    if not metrics:
+   572→        return 0, []
+   573→
+   574→    best = max(metrics, key=lambda x: x.score)
+   575→    serial = [
+   576→        {
+   577→            "index": m.index,
+   578→            "score": round(m.score, 4),
+   579→            "brightness": round(m.brightness, 4),
+   580→            "white_ratio": round(m.white_ratio, 4),
+   581→            "floor_open_ratio": round(m.floor_open_ratio, 4),
+   582→            "room_likeness": round(getattr(m, "room_likeness", 0.5), 4),
+   583→            "close_up_penalty": round(getattr(m, "close_up_penalty", 0.0), 4),
+   584→        }
+   585→        for m in metrics
+   586→    ]
+   587→    return best.index, serial
+   588→
+   589→
+   590→def yahoo_route_check(from_station: str, to_station: str) -> RouteCheck:
+   591→    from_station = re.sub(r"\\s+", "", from_station or "")
+   592→    if not from_station:
+   593→        return RouteCheck(destination=to_station, minutes=None, transfers=None, ok=False, source="no_from_station")
+   594→
+   595→    url = "https://transit.yahoo.co.jp/search/result"
+   596→    params = {"from": from_station, "to": to_station, "y": datetime.now().year, "m": datetime.now().month, "d": datetime.now().day, "hh": "09", "m1": "0", "m2": "0", "type": "1"}
+   597→    try:
+   598→        r = requests.get(url, params=params, timeout=HTTP_TIMEOUT, headers={"User-Agent": UA})
+   599→        r.raise_for_status()
+   600→        html = r.text
+   601→
+   602→        soup = BeautifulSoup(html, "lxml")
+   603→        text = soup.get_text("\n", strip=True)
+   604→
+   605→        time_matches = [int(x) for x in re.findall(r"(\\d{1,3})分", text)]
+   606→        transfer_matches = [int(x) for x in re.findall(r"乗換\\s*[:：]?\\s*(\\d+)回", text)]
+   607→
+   608→        minutes = min(time_matches) if time_matches else None
+   609→        transfers = min(transfer_matches) if transfer_matches else None
+   610→
+   611→        ok = False
+   612→        if minutes is not None and transfers is not None:
+   613→            ok = (transfers == 0) or (minutes <= 40 and transfers <= 1)
+   614→        elif minutes is not None:
+   615→            ok = minutes <= 40
+   616→
+   617→        return RouteCheck(destination=to_station, minutes=minutes, transfers=transfers, ok=ok, source=r.url)
+   618→    except Exception:
+   619→        return RouteCheck(destination=to_station, minutes=None, transfers=None, ok=False, source="route_fetch_failed")
+   620→
+   621→
+   622→def analyze_station_access(station: str) -> Dict[str, Any]:
+   623→    checks = [yahoo_route_check(station, dest) for dest in MAIN_STATIONS]
+   624→    pass_any = any(c.ok for c in checks)
+   625→    parsed_any = any(c.minutes is not None for c in checks)
+   626→
+   627→    rows = []
+   628→    for c in checks:
+   629→        rows.append({
+   630→            "destination": c.destination,
+   631→            "minutes": c.minutes,
+   632→            "transfers": c.transfers,
+   633→            "ok": c.ok,
+   634→            "source": c.source,
+   635→        })
+   636→
+   637→    return {
+   638→        "station": station,
+   639→        "pass_any": pass_any,
+   640→        "parsed_any": parsed_any,
+   641→        "details": rows,
+   642→    }
+   643→
+   644→
+   645→def gemini_review(payload: Dict[str, Any]) -> Dict[str, Any]:
+   646→    # 「必ず解析」はここで実行。キーが無い場合でもヒューリスティック解析を返す。
+   647→    api_key = (
+   648→        os.getenv("GEMINI_API_KEY", "").strip()
+   649→        or os.getenv("GOOGLE_API_KEY", "").strip()
+   650→        or os.getenv("GEMINI_API", "").strip()
+   651→    )
+   652→    heuristic_ok = bool(payload.get("image_quality_ok"))
+   653→
+   654→    if not api_key or genai is None:
+   655→        return {
+   656→            "engine": "heuristic",
+   657→            "decision": "adopt" if heuristic_ok else "bots",
+   658→            "reason": "gemini_api_unavailable",
+   659→        }
+   660→
+   661→    prompt = (
+   662→        "あなたは不動産SNS投稿の審査AIです。JSONを読み、adopt か bots を返してください。"
+   663→        "基準: 明るい白基調・床面積が広く見える画像を優先。"
+   664→        "駅アクセス条件は今回の判定から除外してください。"
+   665→        "出力はJSONのみ {\"decision\":\"adopt|bots\",\"reason\":\"...\",\"priority\":\"high|normal|low\"}"
+   666→        f"\n入力: {json.dumps(payload, ensure_ascii=False)}"
+   667→    )
+   668→
+   669→    try:
+   670→        client = genai.Client(api_key=api_key)
+   671→        resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+   672→        text = (resp.text or "").strip()
+   673→        m = re.search(r"\{.*\}", text, flags=re.S)
+   674→        if not m:
+   675→            raise ValueError("json block not found")
+   676→        parsed = json.loads(m.group(0))
+   677→        decision = str(parsed.get("decision", "")).lower()
+   678→        if decision not in ("adopt", "bots"):
+   679→            decision = "adopt" if heuristic_ok else "bots"
+   680→        return {
+   681→            "engine": "gemini-2.5-flash",
+   682→            "decision": decision,
+   683→            "reason": parsed.get("reason", ""),
+   684→            "priority": parsed.get("priority", "normal"),
+   685→        }
+   686→    except Exception as e:
+   687→        return {
+   688→            "engine": "heuristic_fallback",
+   689→            "decision": "adopt" if heuristic_ok else "bots",
+   690→            "reason": f"gemini_error:{e}",
+   691→        }
+   692→
+   693→
+   694→def to_video_record(detail: Dict[str, Any], access: Dict[str, Any], cover_index: int, image_metrics: List[Dict[str, Any]], review: Dict[str, Any]) -> Dict[str, Any]:
+   695→    title = detail.get("title") or "property"
+   696→    room = detail.get("room_number") or ""
+   697→    pid = base.sanitize_filename(f"{title}_{room}") or f"prop_{int(time.time() * 1000)}"
+   698→
+   699→    image_urls = detail.get("image_urls") or []
+   700→    if 0 <= cover_index < len(image_urls):
+   701→        ordered_images = [image_urls[cover_index]] + [u for i, u in enumerate(image_urls) if i != cover_index]
+   702→    else:
+   703→        ordered_images = image_urls
+   704→
+   705→    stations = detail.get("stations") or []
+   706→    station = stations[0] if stations else ""
+   707→
+   708→    facilities = detail.get("facilities") or []
+   709→    picked_features = [f for f in TARGET_FEATURES if any(f in str(v) for v in facilities)]
+   710→    for fallback in ["オートロック", "宅配ボックス", "南向き", "角部屋"]:
+   711→        if len(picked_features) >= 3:
+   712→            break
+   713→        if fallback not in picked_features:
+   714→            picked_features.append(fallback)
+   715→
+   716→    new_flag = is_new_building(detail)
+   717→    layout = str(detail.get("layout") or "")
+   718→
+   719→    return {
+   720→        "id": pid,
+   721→        "images": ordered_images,
+   722→        "price": format_price(detail.get("rent")),
+   723→        "layout": layout,
+   724→        "station": str(station),
+   725→        "features": picked_features[:3],
+   726→        "is_new_building": new_flag,
+   727→        "overlay_headline": ("新築 " if new_flag else "") + layout,
+   728→        "cover_index_original": cover_index,
+   729→        "image_metrics": image_metrics,
+   730→        "access_check": access,
+   731→        "review": review,
+   732→        "selection_tag": "採用データ" if review.get("decision") == "adopt" else "BOTS",
+   733→        "detail_url": detail.get("detail_url", ""),
+   734→    }
+   735→
+   736→
+   737→def scrape_and_review(context, urls: List[str]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str]]:
+   738→    adopted: List[Dict[str, Any]] = []
+   739→    bots: List[Dict[str, Any]] = []
+   740→    attempted_urls: List[str] = []
+   741→
+   742→    for idx, url in enumerate(urls, start=1):
+   743→        attempted_urls.append(url)
+   744→        page = context.new_page()
+   745→        try:
+   746→            log(f"詳細取得 {idx}/{len(urls)}: {url}")
+   747→            page.goto(url, wait_until="domcontentloaded", timeout=25000)
+   748→            base.fully_render(page)
+   749→            base.wait_for_detail_content(page, timeout_ms=7000)
+   750→            body = page.evaluate("document.body.innerText")
+   751→
+   752→            detail = base.extract_property_details(page, body)
+   753→            detail["detail_url"] = url
+   754→            image_urls = detail.get("image_urls") or []
+   755→            if len(image_urls) < 5:
+   756→                continue
+   757→
+   758→            station = (detail.get("stations") or [""])[0]
+   759→            access = {
+   760→                "station": station,
+   761→                "pass_any": True,
+   762→                "parsed_any": False,
+   763→                "details": [],
+   764→                "source": "access_check_disabled",
+   765→            }
+   766→
+   767→            cover_index, metrics = pick_cover_index(image_urls)
+   768→            top_score = max([m["score"] for m in metrics], default=0.0)
+   769→            image_quality_ok = top_score >= 0.43
+   770→
+   771→            review_input = {
+   772→                "title": detail.get("title", ""),
+   773→                "layout": detail.get("layout", ""),
+   774→                "rent": detail.get("rent", ""),
+   775→                "station": station,
+   776→                "is_new_building": is_new_building(detail),
+   777→                "image_quality_ok": image_quality_ok,
+   778→                "top_image_score": top_score,
+   779→                "facilities": detail.get("facilities", []),
+   780→            }
+   781→            review = gemini_review(review_input)
+   782→
+   783→            record = to_video_record(detail, access, cover_index, metrics, review)
+   784→            if not record["price"] or not record["layout"]:
+   785→                continue
+   786→
+   787→            if record["selection_tag"] == "採用データ":
+   788→                adopted.append(record)
+   789→            else:
+   790→                bots.append(record)
+   791→
+   792→            if 0 < MAX_PROPERTIES <= (len(adopted) + len(bots)):
+   793→                break
+   794→        except Exception as e:
+   795→            log(f"[WARN] 詳細取得失敗: {e}")
+   796→        finally:
+   797→            page.close()
+   798→
+   799→    return adopted, bots, attempted_urls
+   800→
+   801→
+   802→def save_outputs(adopted: List[Dict[str, Any]], bots: List[Dict[str, Any]], filtered_urls: List[str], attempted_urls: List[str]) -> None:
+   803→    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+   804→    OUTPUT_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+   805→
+   806→    uniq_adopted: Dict[str, Dict[str, Any]] = {}
+   807→    for r in adopted:
+   808→        rid = r.get("id")
+   809→        if rid and rid not in uniq_adopted:
+   810→            uniq_adopted[rid] = r
+   811→
+   812→    uniq_bots: Dict[str, Dict[str, Any]] = {}
+   813→    for r in bots:
+   814→        rid = r.get("id")
+   815→        if rid and rid not in uniq_bots:
+   816→            uniq_bots[rid] = r
+   817→
+   818→    adopted_list = list(uniq_adopted.values())
+   819→    bots_list = list(uniq_bots.values())
+   820→
+   821→    with OUTPUT_DATA_PATH.open("w", encoding="utf-8") as f:
+   822→        json.dump(adopted_list, f, ensure_ascii=False, indent=2)
+   823→
+   824→    with (OUTPUT_DIR / "BOTS_list.json").open("w", encoding="utf-8") as f:
+   825→        json.dump(bots_list, f, ensure_ascii=False, indent=2)
+   826→
+   827→    with (OUTPUT_DIR / "filtered_urls.json").open("w", encoding="utf-8") as f:
+   828→        json.dump(filtered_urls, f, ensure_ascii=False, indent=2)
+   829→
+   830→    all_rows = adopted_list + bots_list
+   831→    pd.DataFrame(all_rows).to_csv(OUTPUT_DIR / "review_summary.csv", index=False, encoding="utf-8-sig")
+   832→
+   833→    prev_seen = load_seen_urls()
+   834→    now_seen = {u for u in attempted_urls if u and "/rent_rooms/" in u}
+   835→    now_seen.update(
+   836→        str(r.get("detail_url") or "").strip()
+   837→        for r in adopted_list + bots_list
+   838→        if r.get("detail_url") and "/rent_rooms/" in str(r.get("detail_url"))
+   839→    )
+   840→    merged_seen = prev_seen | now_seen
+   841→    save_seen_urls(merged_seen)
+   842→
+   843→    saved_adopt = save_record_images(adopted_list, "adopted")
+   844→    saved_bots = save_record_images(bots_list, "bots")
+   845→
+   846→    log(f"保存完了: {OUTPUT_DATA_PATH} (採用 {len(adopted_list)}件)")
+   847→    log(f"保存完了: {OUTPUT_DIR / 'BOTS_list.json'} (BOTS {len(bots_list)}件)")
+   848→    log(f"保存完了: {SEEN_URLS_PATH} (累計 {len(merged_seen)}件)")
+   849→    if SAVE_REVIEW_IMAGES:
+   850→        log(f"画像保存: adopted={saved_adopt}枚, bots={saved_bots}枚 -> {SAVED_IMAGES_DIR}")
+   851→
+   852→
+   853→def main() -> None:
+   854→    log("専用スクレイパーを開始")
+   855→    log("ログイン処理は scrape_itanji.auto_login をそのまま利用")
+   856→
+   857→    with sync_playwright() as p:
+   858→        browser = p.chromium.launch(headless=HEADLESS)
+   859→        context = browser.new_context()
+   860→        base.configure_context(context)
+   861→        page = context.new_page()
+   862→
+   863→        page.goto(TOP_URL, wait_until="load", timeout=60000)
+   864→        if not base.auto_login(page):
+   865→            raise SystemExit("ログインに失敗しました")
+   866→
+   867→        if not apply_search_filters(page):
+   868→            raise SystemExit("検索条件の適用に失敗しました")
+   869→
+   870→        filtered_urls_all = collect_filtered_urls(page)
+   871→        seen_urls = load_seen_urls()
+   872→        filtered_urls = [u for u in filtered_urls_all if u not in seen_urls]
+   873→        skipped_seen = len(filtered_urls_all) - len(filtered_urls)
+   874→        log(f"抽出URL件数(申込なし+画像{MIN_IMAGES}枚以上): {len(filtered_urls_all)}")
+   875→        log(f"再取得除外件数(seen): {skipped_seen}")
+   876→        log(f"今回の詳細取得対象件数: {len(filtered_urls)}")
+   877→
+   878→        adopted, bots, attempted_urls = scrape_and_review(context, filtered_urls)
+   879→        save_outputs(adopted, bots, filtered_urls, attempted_urls)
+   880→
+   881→        browser.close()
+   882→
+   883→
+   884→if __name__ == "__main__":
+   885→    # 初回実行時:
+   886→    #   pip install -r requirements.txt
+   887→    #   playwright install
+   888→    # Geminiを使う場合:
+   889→    #   set GEMINI_API_KEY=your_api_key
+   890→    main()
+   891→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

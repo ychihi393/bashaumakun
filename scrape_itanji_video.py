@@ -36,6 +36,16 @@ TARGET_CITIES_RAW = [
     "東村山市", "国分寺市", "国立市", "福生市", "東大和市", "日野市", "東久留米市", "西東京市",
 ]
 AREA_FALLBACK_MAP = {}
+
+# 埼玉県の対象市
+SAITAMA_CITIES = [
+    "戸田市", "川口市", "さいたま市", "蕨市", "所沢市", "ふじみ野市", "和光市", "草加市",
+]
+
+# 千葉県の対象市
+CHIBA_CITIES = [
+    "船橋市", "習志野市", "千葉市", "市川市", "浦安市", "流山市", "松戸市",
+]
 TARGET_FEATURES = ["バストイレ別", "温水洗浄便座", "独立洗面台"]
 
 MAIN_STATIONS = ["新宿駅", "渋谷駅", "池袋駅", "東京駅", "品川駅", "大手町駅", "飯田橋駅"]
@@ -191,18 +201,28 @@ def apply_search_filters(page: Page) -> bool:
         return False
     page.wait_for_timeout(700)
 
-    check_by_text(page, "東京都")
-    page.wait_for_timeout(500)
+    def _select_prefecture_areas(pref: str, areas: List[str]) -> None:
+        """都道府県を選択してから市区町村にチェックを入れる"""
+        check_by_text(page, pref)
+        page.wait_for_timeout(500)
+        ok = ng = 0
+        for area in areas:
+            if check_by_text(page, area):
+                ok += 1
+            else:
+                ng += 1
+                log(f"[WARN] area not found in UI ({pref}): {area}")
+        log(f"[INFO] {pref} area select: ok={ok}, not_found={ng}")
+        page.wait_for_timeout(300)
 
-    ok = 0
-    ng = 0
-    for area in normalize_area_names():
-        if check_by_text(page, area):
-            ok += 1
-        else:
-            ng += 1
-            log(f"[WARN] area not found in UI: {area}")
-    log(f"[INFO] area select result: ok={ok}, not_found={ng}")
+    # 東京都: 区部 + 市部
+    _select_prefecture_areas("東京都", normalize_area_names())
+
+    # 埼玉県
+    _select_prefecture_areas("埼玉県", SAITAMA_CITIES)
+
+    # 千葉県
+    _select_prefecture_areas("千葉県", CHIBA_CITIES)
 
     if not safe_click(page, ['button:has-text("決定")', 'button:has(div:has-text("決定"))'], "所在地の決定"):
         check_by_text(page, "決定")

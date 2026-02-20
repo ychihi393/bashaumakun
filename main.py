@@ -10,6 +10,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import math
+
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
@@ -43,17 +45,25 @@ CLEAN_COPY_TXT_PATH = OUTPUT_ROOT / "コピペ専用_タイトルキャプショ
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_COVER_PICK_MAX_IMAGES = int(os.getenv("POSTGEN_GEMINI_COVER_PICK_MAX_IMAGES", "10"))
 
-# 日本語フォント候補（太字優先）
+# 日本語フォント候補（手書き風優先 → 太字ゴシックにフォールバック）
+# ★おすすめ無料フォント: 「851チカラづよく」をダウンロードしてインストールすると
+#   Instagram映えするキャッチーな手書き風になります。
+#   https://pm85.com/ で「851チカラづよく」を検索してダウンロード後、
+#   C:\Windows\Fonts\ にインストール（ファイルを右クリック→インストール）
 _FONT_CANDIDATES = [
-    r"C:\Windows\Fonts\MPLUS1p-Bold.ttf",
-    r"C:\Windows\Fonts\BIZUDGothic-Bold.ttc",
+    r"C:\Windows\Fonts\851CHIKARA-DZUYOKU_kanaA_004.ttf",  # 851チカラづよく（要インストール・最推奨）
+    r"C:\Windows\Fonts\HGRGE.TTC",           # HGS行書E（筆書き風・最もキャッチー）
+    r"C:\Windows\Fonts\HGRSMP.TTF",          # HGP正楷書体（手書き・楷書）
+    r"C:\Windows\Fonts\HGRSKP.TTF",          # HGP教科書体（手書き風）
+    r"C:\Windows\Fonts\UDDigiKyokashoN-B.ttc",  # UD教科書体Bold
+    r"C:\Windows\Fonts\HGRPRE.TTC",
     r"C:\Windows\Fonts\BIZ-UDGothicB.ttc",
     r"C:\Windows\Fonts\meiryob.ttc",
-    r"C:\Windows\Fonts\meiryo.ttc",
     r"C:\Windows\Fonts\YuGothB.ttc",
-    r"C:\Windows\Fonts\YuGothM.ttc",
+    r"C:\Windows\Fonts\NotoSansJP-VF.ttf",
     r"C:\Windows\Fonts\msgothic.ttc",
 ]
+_cached_font_path: Optional[str] = None
 
 
 def setup_logger() -> None:
@@ -222,34 +232,62 @@ def _contain(im: Image.Image, w: int, h: int) -> Image.Image:
     return bg
 
 
-def create_candidate_catalog(paths: List[Path]) -> Optional[Image.Image]:
+def create_property_catalog(paths: List[Path], name: str = "") -> Optional[Image.Image]:
+    """
+    1物件の候補画像を横長カタログ画像に並べる（最大15枚、5列）。
+    番号バッジ・番号ラベルはSlackボタンの番号と完全に一致する。
+    """
     if not paths:
         return None
-    n = len(paths)
-    cols = 3 if n > 4 else 2
-    rows = int(np.ceil(n / cols))
-    tile = 360
-    gap = 20
-    top = 40
-    cw = cols * tile + (cols + 1) * gap
-    ch = rows * tile + (rows + 1) * gap + top
-    canvas = Image.new("RGB", (cw, ch), (245, 248, 252))
-    draw = ImageDraw.Draw(canvas)
-    font = ImageFont.load_default()
-    for i, p in enumerate(paths):
+
+    COLS    = 5
+    THUMB_W = 190
+    THUMB_H = 238
+    NUM_H   = 32
+    GAP     = 10
+    TOP_PAD = 48
+    BADGE_COLOR = (33, 118, 255)
+
+    n    = min(len(paths), 15)
+    rows = math.ceil(n / COLS)
+    canvas_w = COLS * THUMB_W + (COLS + 1) * GAP
+    canvas_h = TOP_PAD + rows * (THUMB_H + NUM_H + GAP) + GAP
+
+    canvas = Image.new("RGB", (canvas_w, canvas_h), (245, 248, 252))
+    draw   = ImageDraw.Draw(canvas)
+    fhdr   = _load_font(20)
+    fbadge = _load_font(20)
+    fnum   = _load_font(18)
+
+    label = "文字入れ画像を選んでください" + (f"  ({name})" if name else "")
+    draw.text((GAP, 12), label, fill=(40, 60, 80), font=fhdr)
+
+    for i, path in enumerate(paths[:15]):
+        row, col = divmod(i, COLS)
+        x = GAP + col * (THUMB_W + GAP)
+        y = TOP_PAD + row * (THUMB_H + NUM_H + GAP)
+
         try:
-            with Image.open(p) as im:
-                thumb = _contain(im.convert("RGB"), tile, tile)
+            with Image.open(path) as im:
+                thumb = _contain(im.convert("RGB"), THUMB_W, THUMB_H)
         except Exception:
-            continue
-        r, c = divmod(i, cols)
-        x = gap + c * (tile + gap)
-        y = top + gap + r * (tile + gap)
+            thumb = Image.new("RGB", (THUMB_W, THUMB_H), (200, 200, 210))
         canvas.paste(thumb, (x, y))
-        draw.rectangle([x, y, x + 56, y + 34], fill=(33, 118, 255))
-        draw.text((x + 14, y + 8), str(i + 1), fill=(255, 255, 255), font=font)
-    draw.text((gap, 10), "カバー画像を番号で選択", fill=(40, 60, 80), font=font)
+
+        # 番号バッジ（左上）
+        nstr = str(i + 1)
+        bw = 32 if len(nstr) == 1 else 46
+        bh = 26
+        draw.rectangle([x, y, x + bw, y + bh], fill=BADGE_COLOR)
+        draw.text((x + bw // 2, y + bh // 2), nstr, fill=(255, 255, 255), font=fbadge, anchor="mm")
+        # 番号（サムネイル下）
+        draw.text((x + THUMB_W // 2, y + THUMB_H + 4), nstr, fill=BADGE_COLOR, font=fnum, anchor="mt")
+
     return canvas
+
+
+# 後方互換エイリアス（旧コードからの参照用）
+create_candidate_catalog = create_property_catalog
 
 
 def _fit_4x5(im: Image.Image) -> Image.Image:
@@ -267,6 +305,16 @@ def _fit_4x5(im: Image.Image) -> Image.Image:
             y0 = max(0, (h - nh) // 2)
             crop = im.crop((0, y0, w, y0 + nh))
         return crop.resize((target_w, target_h), Image.Resampling.LANCZOS)
+    # 横長画像: SD アウトペインティングを試みる（USE_SD_OUTPAINTING=1 の場合）
+    try:
+        from sd_outpainter import outpaint_to_4x5
+        sd_result = outpaint_to_4x5(im)
+        if sd_result is not None:
+            return sd_result
+    except Exception as _sd_err:
+        logging.info("[SD] スキップ: %s", _sd_err)
+
+    # フォールバック: ぼかし背景で上下を埋める
     bg = im.resize((target_w, target_h), Image.Resampling.LANCZOS).filter(ImageFilter.GaussianBlur(radius=18))
     fg = _contain(im, target_w, target_h)
     bg.paste(fg, (0, 0))
@@ -278,61 +326,291 @@ def _upscale(im: Image.Image) -> Image.Image:
     return im.resize((int(w * 1.5), int(h * 1.5)), Image.Resampling.LANCZOS)
 
 
-def _load_font(size: int) -> ImageFont.FreeTypeFont:
-    """日本語が使えるフォントをロードする。見つからなければデフォルト。"""
+def _load_font(size: int) -> ImageFont.ImageFont:
+    """日本語が使えるフォントをロードする。キャッシュして高速化。"""
+    global _cached_font_path
+    # キャッシュ済みフォントを使う
+    if _cached_font_path:
+        try:
+            return ImageFont.truetype(_cached_font_path, size)
+        except Exception:
+            _cached_font_path = None  # キャッシュが無効なら再探索
+
     for path in _FONT_CANDIDATES:
         if Path(path).exists():
             try:
-                return ImageFont.truetype(path, size)
+                font = ImageFont.truetype(path, size)
+                _cached_font_path = path
+                logging.debug("フォント: %s", path)
+                return font
             except Exception:
                 continue
+
+    # フォールバック: Windows Fonts ディレクトリをスキャン
+    fonts_dir = Path(r"C:\Windows\Fonts")
+    if fonts_dir.exists():
+        for name in ["BIZ-UDGothicB.ttc", "meiryob.ttc", "YuGothB.ttc", "msgothic.ttc"]:
+            p = fonts_dir / name
+            if p.exists():
+                try:
+                    font = ImageFont.truetype(str(p), size)
+                    _cached_font_path = str(p)
+                    return font
+                except Exception:
+                    continue
+        # 任意の .ttc を試す
+        for p in list(fonts_dir.glob("*.ttc"))[:20]:
+            try:
+                font = ImageFont.truetype(str(p), size)
+                _cached_font_path = str(p)
+                return font
+            except Exception:
+                continue
+
+    logging.warning("日本語フォントが見つかりません。デフォルトフォントを使用します")
     return ImageFont.load_default()
 
 
-def _draw_overlay(im: Image.Image, lines: List[str]) -> Image.Image:
+def _draw_overlay(im: Image.Image, overlay_data: Dict[str, str]) -> Image.Image:
     """
-    画像下部に複数行テキストを重ねる。
-    - 半透明黒帯を敷いてから白文字で描画（影付き）
-    - lines: 表示したいテキストのリスト（最大3行）
+    画像中央にテキストオーバーレイを描画する。
+
+    overlay_data:
+      tag    - 行1 (朱色)       例: "新着"
+      main   - 行2 (淡い黄緑)   例: "池袋まで30分"
+      attr   - 行3前半 (淡い黄) 例: "新築 1LDK"
+      detail - 行3後半 (白)     例: "8.9万"
+
+    エフェクト: ぼかし黒グロー（太い黒縁をガウスぼかし）+ 細い白外フチ
+    テキスト折り返し: 1行最大9文字、超えたら改行
     """
     out = im.copy().convert("RGBA")
     w, h = out.size
+    draw = ImageDraw.Draw(out)
+    cx = w // 2
 
-    lines = [str(l).strip() for l in lines if str(l).strip()][:3]
-    if not lines:
+    # フォントサイズ（縦幅基準・やや控えめ）
+    size_tag  = max(12, int(h * 0.045))
+    size_main = max(14, int(h * 0.058))
+    size_attr = max(14, int(h * 0.058))
+    font_tag  = _load_font(size_tag)
+    font_main = _load_font(size_main)
+    font_attr = _load_font(size_attr)
+
+    scale  = max(0.5, h / 1350.0)
+    sw_b   = max(5, int(9 * scale))    # グロー用ストローク幅（太め）
+    sw_w   = max(1, int(2 * scale))    # 白外フチ幅
+    blur_r = max(4, int(sw_b * 1.3))   # ぼかし半径
+
+    tag_text    = str(overlay_data.get("tag")    or "").strip()
+    main_text   = str(overlay_data.get("main")   or "").strip()
+    attr_text   = str(overlay_data.get("attr")   or "").strip()
+    detail_text = str(overlay_data.get("detail") or "").strip()
+
+    if not any([tag_text, main_text, attr_text, detail_text]):
+        logging.warning("_draw_overlay: テキストが空のためオーバーレイをスキップ")
         return out.convert("RGB")
 
-    sizes = [62, 54, 48]
-    line_gap = 14
-    pad_x, pad_bottom = 36, 44
+    logging.info("文字入れ: tag=%r / main=%r / attr=%r / detail=%r",
+                 tag_text, main_text, attr_text, detail_text)
 
-    # 各行の高さを計算して帯の高さを決める
-    fonts = [_load_font(sizes[i] if i < len(sizes) else 44) for i in range(len(lines))]
-    line_heights = []
-    for font, text in zip(fonts, lines):
-        dummy = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
-        bb = dummy.textbbox((0, 0), text, font=font)
-        line_heights.append(bb[3] - bb[1])
+    _dm = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
 
-    total_text_h = sum(line_heights) + line_gap * (len(lines) - 1)
-    band_h = total_text_h + pad_bottom * 2
+    def _lh(font, text: str = "Ag") -> int:
+        """1行分のピクセル高さを返す"""
+        try:
+            bb = _dm.textbbox((0, 0), text, font=font, anchor="lt")
+            return max(1, bb[3] - bb[1])
+        except Exception:
+            return font.size
 
-    # 半透明帯
-    overlay = Image.new("RGBA", (w, band_h), (0, 0, 0, 0))
-    band_draw = ImageDraw.Draw(overlay)
-    band_draw.rectangle([0, 0, w, band_h], fill=(10, 10, 10, 175))
-    out.paste(overlay, (0, h - band_h), overlay)
+    section_gap = max(6, int(scale * 10))  # セクション間ギャップ
 
-    draw = ImageDraw.Draw(out)
-    y = h - band_h + pad_bottom
-    for font, text, lh in zip(fonts, lines, line_heights):
-        # 影
-        draw.text((pad_x + 2, y + 2), text, font=font, fill=(0, 0, 0, 200))
-        # 本文
-        draw.text((pad_x, y), text, font=font, fill=(255, 255, 255, 255))
-        y += lh + line_gap
+    # rows: list of (text, font, color, gap_before, is_split, attr_str, det_str)
+    # 折り返しなし: 各フィールドを1行で表示
+    rows: List[tuple] = []
+
+    if tag_text:
+        rows.append((tag_text, font_tag, (220, 60, 30), 0, False, "", ""))
+
+    if main_text:
+        gap = section_gap if rows else 0
+        rows.append((main_text, font_main, (155, 210, 70), gap, False, "", ""))
+
+    if attr_text and detail_text:
+        gap = section_gap if rows else 0
+        combined = attr_text + "  " + detail_text
+        rows.append((combined, font_attr, (235, 215, 60), gap, True, attr_text, detail_text))
+    elif attr_text:
+        gap = section_gap if rows else 0
+        rows.append((attr_text, font_attr, (235, 215, 60), gap, False, "", ""))
+    elif detail_text:
+        gap = section_gap if rows else 0
+        rows.append((detail_text, font_attr, (255, 255, 255), gap, False, "", ""))
+
+    if not rows:
+        return out.convert("RGB")
+
+    # 総高さを計算してブロック全体を縦中央に配置
+    total_h = sum(_lh(row[1], row[0]) + sw_b + row[3] for row in rows)
+    block_top = int(h * 0.46) - total_h // 2
+    cur_y = block_top
+
+    def _glow(x: int, y: int, text: str, font, fill: tuple, anchor: str = "mm") -> None:
+        """ぼかし黒グロー + 白外フチ + 本体テキストを描画"""
+        if not text:
+            return
+        # 1. ぼかし黒グロー（太いストロークをガウスぼかし）
+        glow_img = Image.new("RGBA", out.size, (0, 0, 0, 0))
+        gd = ImageDraw.Draw(glow_img)
+        gd.text((x, y), text, font=font, fill=(0, 0, 0, 210), anchor=anchor,
+                stroke_width=sw_b, stroke_fill=(0, 0, 0, 210))
+        out.alpha_composite(glow_img.filter(ImageFilter.GaussianBlur(radius=blur_r)))
+        # 2. 白外フチ + 本体テキスト
+        draw.text((x, y), text, font=font, fill=fill, anchor=anchor,
+                  stroke_width=sw_w, stroke_fill=(255, 255, 255))
+
+    for (text, font, color, gap, is_split, attr, det) in rows:
+        lh = _lh(font, text)
+        cy = cur_y + gap + (lh + sw_b) // 2
+        cur_y += gap + lh + sw_b
+
+        if is_split:
+            # attr（淡い黄）と detail（白）を同行に並べて2色で描画
+            try:
+                aw  = _dm.textlength(attr, font=font)
+                spw = _dm.textlength("  ", font=font)
+                dw  = _dm.textlength(det,  font=font)
+                x0  = cx - int((aw + spw + dw) / 2)
+            except Exception:
+                x0  = cx - len(text) * size_attr // 2
+                aw  = float(size_attr * len(attr))
+                spw = float(size_attr)
+            # glow はテキスト全体で1回
+            glow_img = Image.new("RGBA", out.size, (0, 0, 0, 0))
+            gd = ImageDraw.Draw(glow_img)
+            gd.text((cx, cy), text, font=font, fill=(0, 0, 0, 210), anchor="mm",
+                    stroke_width=sw_b, stroke_fill=(0, 0, 0, 210))
+            out.alpha_composite(glow_img.filter(ImageFilter.GaussianBlur(radius=blur_r)))
+            draw.text((x0,                 cy), attr, font=font, fill=(235, 215, 60),
+                      anchor="lm", stroke_width=sw_w, stroke_fill=(255, 255, 255))
+            draw.text((x0 + int(aw + spw), cy), det,  font=font, fill=(255, 255, 255),
+                      anchor="lm", stroke_width=sw_w, stroke_fill=(255, 255, 255))
+        else:
+            _glow(cx, cy, text, font, color)
 
     return out.convert("RGB")
+
+
+def create_all_properties_catalog(
+    prop_data: List[Tuple[str, List[Optional[Path]]]],
+    max_candidates: int = 4,
+) -> Optional[Image.Image]:
+    """
+    全物件の候補画像を1枚の横長カタログ画像に生成する。
+
+    レイアウト:
+      各行 = 1物件（左端に物件番号、右に候補画像を横並び）
+      候補画像の番号はSlackボタンの番号と完全一致（左→右が1,2,3,4）
+
+    prop_data: [(物件名, [候補パス1, 候補パス2, ...]), ...]
+    max_candidates: 1物件あたりの最大候補数（Slackボタン制限に合わせ最大4）
+    """
+    if not prop_data:
+        return None
+
+    LABEL_W = 68    # 左の物件番号エリア幅
+    THUMB_W = 210   # 各候補サムネイル幅
+    THUMB_H = 265   # 各候補サムネイル高さ（縦型）
+    NUM_H   = 34    # サムネイル下の番号表示エリア
+    GAP     = 10    # 各要素の間隔
+    TOP_PAD = 48    # ヘッダー用上部余白
+    BG_COLOR    = (245, 248, 252)
+    BADGE_COLOR = (33, 118, 255)
+    LABEL_COLOR = (60, 80, 100)
+
+    n_props = len(prop_data)
+    # 実際の最大候補数を算出（max_candidates以下に制限）
+    actual_max = min(max((len(ps) for _, ps in prop_data), default=1), max_candidates)
+
+    canvas_w = LABEL_W + actual_max * (THUMB_W + GAP) + GAP
+    row_h    = THUMB_H + NUM_H + GAP
+    canvas_h = TOP_PAD + n_props * (row_h + GAP) + GAP
+
+    canvas = Image.new("RGB", (canvas_w, canvas_h), BG_COLOR)
+    draw   = ImageDraw.Draw(canvas)
+
+    font_header    = _load_font(20)
+    font_prop_num  = _load_font(30)   # 左端の物件番号
+    font_badge     = _load_font(22)   # 候補番号バッジ
+    font_num_below = _load_font(20)   # 候補番号（サムネイル下）
+
+    draw.text(
+        (GAP, 12),
+        "文字入れする画像の番号を各物件ごとに押してください",
+        fill=LABEL_COLOR,
+        font=font_header,
+    )
+
+    for prop_i, (name, paths) in enumerate(prop_data):
+        row_y = TOP_PAD + prop_i * (row_h + GAP)
+
+        # 左端: 物件番号
+        prop_num_str = str(prop_i + 1)
+        draw.text(
+            (LABEL_W // 2, row_y + THUMB_H // 2),
+            prop_num_str,
+            fill=LABEL_COLOR,
+            font=font_prop_num,
+            anchor="mm",
+        )
+        # 仕切り線（物件ごとに）
+        if prop_i > 0:
+            draw.line(
+                [(0, row_y - GAP // 2), (canvas_w, row_y - GAP // 2)],
+                fill=(210, 215, 225),
+                width=1,
+            )
+
+        for cand_i, path in enumerate(paths[:max_candidates]):
+            x = LABEL_W + cand_i * (THUMB_W + GAP)
+            y = row_y
+
+            # サムネイル
+            if path and path.exists():
+                try:
+                    with Image.open(path) as im:
+                        thumb = _contain(im.convert("RGB"), THUMB_W, THUMB_H)
+                except Exception:
+                    thumb = Image.new("RGB", (THUMB_W, THUMB_H), (200, 200, 210))
+            else:
+                thumb = Image.new("RGB", (THUMB_W, THUMB_H), (200, 200, 210))
+
+            canvas.paste(thumb, (x, y))
+
+            # 候補番号バッジ（左上）
+            cand_num_str = str(cand_i + 1)
+            badge_w = 36 if len(cand_num_str) == 1 else 50
+            badge_h = 28
+            draw.rectangle([x, y, x + badge_w, y + badge_h], fill=BADGE_COLOR)
+            draw.text(
+                (x + badge_w // 2, y + badge_h // 2),
+                cand_num_str,
+                fill=(255, 255, 255),
+                font=font_badge,
+                anchor="mm",
+            )
+
+            # 候補番号（サムネイル下中央）
+            draw.text(
+                (x + THUMB_W // 2, y + THUMB_H + 4),
+                cand_num_str,
+                fill=BADGE_COLOR,
+                font=font_num_below,
+                anchor="mt",
+            )
+
+    return canvas
 
 
 def _extract_json_block(text: str) -> Optional[Dict[str, Any]]:
@@ -419,28 +697,37 @@ def _fallback_caption(record: Dict[str, Any], prop_num: str) -> str:
 
 
 def _gemini_copy(record: Dict[str, Any], property_id: str, prop_num: str) -> Dict[str, str]:
+    fallback_title = _fallback_title(record)
     fallback = {
-        "title": _fallback_title(record),
+        "title":   fallback_title,
         "caption": _fallback_caption(record, prop_num),
-        "overlay_line1": _fallback_title(record),
-        "overlay_line2": "",
+        "tag":     "",
+        "main":    fallback_title,
+        "attr":    "",
+        "detail":  "",
     }
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key or genai is None:
         return fallback
 
+    # 対象主要駅リスト（.env の TARGET_STATIONS で上書き可）
+    target_stations_raw = os.getenv("TARGET_STATIONS", "渋谷,新宿,池袋,品川,東京,銀座,上野,秋葉原").strip()
+    target_stations_str = "・".join(s.strip() for s in target_stations_raw.split(",") if s.strip())
+
+    nearest_station = str(record.get("station") or "")
+
     payload = {
         "prop_num": prop_num,
         "price": str(record.get("price") or ""),
         "layout": str(record.get("layout") or ""),
-        "area_hint": str(record.get("station") or ""),  # エリア参考（出力には駅名を書かせない）
+        "nearest_station_info": nearest_station,
         "features": [str(x) for x in (record.get("features") or [])],
         "is_new_building": bool(record.get("is_new_building")),
     }
     prompt = (
         "あなたは「SNSでバズる不動産アカウント」の専属コピーライターです。\n"
         "目的: 読者に「詳細が気になる」と感じさせ、LINE問い合わせ（CV）につなげる。\n\n"
-        "JSONのみ出力。キーは title, caption, overlay_line1, overlay_line2。\n\n"
+        "JSONのみ出力。キーは title, caption, tag, main, attr, detail。\n\n"
         "【title】\n"
         "- 漢字・数字中心、縦棒｜で区切る（例: 2LDK｜築浅｜南向き）\n"
         "- 物件名・号室・駅名は書かない。エリア（区・市など）はOK\n"
@@ -449,30 +736,58 @@ def _gemini_copy(record: Dict[str, Any], property_id: str, prop_num: str) -> Dic
         "- 構成: フック→物件の魅力（設備・条件3〜4点）→含みを持たせた締め→CTA→ハッシュタグ5個\n"
         "- 物件名・号室・最寄り駅名は書かない。区・エリア・間取り・価格帯はOK\n"
         "- 読者に「どこだろう？詳細が知りたい」と思わせる含みのある表現にする\n"
-        "- CTAは以下の文言で固定:\n"
+        "- スマートフォン表示を前提に読みやすく書く:\n"
+        "  ・1〜2文ごとに改行する（\\n を使う）\n"
+        "  ・段落間は空行（\\n\\n）で区切る\n"
+        "  ・行頭や見出し代わりに絵文字を使う（✨🏠💰🚉📍など）\n"
+        "  ・マークダウン記法（**や##）は使わない — プレーンテキストのみ\n"
+        "  ・箇条書きは「・」を使う\n"
+        "- CTAは以下の文言で固定（改行を維持）:\n"
         "  詳細が気になった方は\n"
         "  プロフのリンクから\n"
         f"  「{prop_num}」\n"
         "  とだけLINEを送ってください。\n"
         "  すぐに詳細をお送りします。\n\n"
-        "【overlay_line1】画像に重ねる1行目テキスト（例: 2LDK｜◯万円台）20文字以内\n"
-        "【overlay_line2】画像に重ねる2行目テキスト（例: 駅名なし・エリアや設備の特徴）20文字以内\n\n"
-        "【禁止】URL、itandibb、bukkakun、業者情報、堅苦しい口調、物件名、号室、駅名\n\n"
+        "【tag】画像オーバーレイ 行1: 物件の状態・特徴を短く（例: \"新着\", \"限定1室\", \"値下げ\"）10文字以内\n"
+        "【main】画像オーバーレイ 行2: 主要駅へのアクセス時間\n"
+        f"  最寄り駅情報: {nearest_station}\n"
+        f"  対象主要駅: {target_stations_str}\n"
+        "  最寄り路線から上記対象駅のうち最もアクセスしやすい1駅を選び、\n"
+        "  実際の所要時間と直通かどうかを調べて記載。\n"
+        "  形式: \"〇〇まで〇分\" または \"〇〇まで〇分(直通)\"\n"
+        "  駅名を書いてよい。15文字以内\n"
+        "【attr】画像オーバーレイ 行3前半: 間取り・建物タイプ（例: \"新築 1LDK\"）10文字以内\n"
+        "【detail】画像オーバーレイ 行3後半: 価格（例: \"8.9万円台\"）10文字以内\n\n"
+        "【禁止】URL、itandibb、bukkakun、業者情報、堅苦しい口調、物件名、号室\n\n"
         f"入力資料(JSON):\n{json.dumps(payload, ensure_ascii=False)}"
     )
     try:
         client = genai.Client(api_key=api_key)
-        resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+        # Google検索グラウンディングで最新の路線情報を参照
+        try:
+            from google.genai import types as _genai_types
+            resp = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=_genai_types.GenerateContentConfig(
+                    tools=[_genai_types.Tool(google_search=_genai_types.GoogleSearch())]
+                ),
+            )
+        except Exception:
+            # 検索グラウンディング非対応の場合はフォールバック
+            resp = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
         parsed = _extract_json_block(getattr(resp, "text", "") or "")
         if not parsed:
             return fallback
-        title = str(parsed.get("title") or fallback["title"]).strip()[:60]
+        title   = str(parsed.get("title")   or fallback["title"]).strip()[:60]
         caption = sanitize_public_caption(str(parsed.get("caption") or fallback["caption"]).strip())
         if len(caption) < 20:
             caption = fallback["caption"]
-        overlay1 = str(parsed.get("overlay_line1") or fallback["overlay_line1"]).strip()[:24]
-        overlay2 = str(parsed.get("overlay_line2") or "").strip()[:24]
-        return {"title": title, "caption": caption, "overlay_line1": overlay1, "overlay_line2": overlay2}
+        tag     = str(parsed.get("tag")    or "").strip()[:12]
+        main    = str(parsed.get("main")   or fallback["main"]).strip()[:24]
+        attr    = str(parsed.get("attr")   or "").strip()[:12]
+        detail  = str(parsed.get("detail") or "").strip()[:12]
+        return {"title": title, "caption": caption, "tag": tag, "main": main, "attr": attr, "detail": detail}
     except Exception as e:
         logging.warning("[%s] Gemini copy fallback: %s", property_id, e.__class__.__name__)
         return fallback
@@ -519,12 +834,14 @@ def _save_property_outputs(record: Dict[str, Any], src_image: Path, copy_payload
     upscaled = _upscale(original)
     resized = _fit_4x5(upscaled)
 
-    # 文字入れ: overlay_line1 / overlay_line2 を使う（なければ title を使う）
-    overlay_lines = [
-        copy_payload.get("overlay_line1") or copy_payload.get("title") or "",
-        copy_payload.get("overlay_line2") or "",
-    ]
-    titled = _draw_overlay(resized, overlay_lines)
+    # 文字入れ: tag/main/attr/detail を使う（なければ title を main にフォールバック）
+    overlay_data = {
+        "tag":    copy_payload.get("tag")    or "",
+        "main":   copy_payload.get("main")   or copy_payload.get("title") or "",
+        "attr":   copy_payload.get("attr")   or "",
+        "detail": copy_payload.get("detail") or "",
+    }
+    titled = _draw_overlay(resized, overlay_data)
 
     original.save(adopted_dir / "01_元画像.jpg", quality=95)
     upscaled.save(adopted_dir / "02_アップスケール済み.png")
@@ -572,83 +889,176 @@ def write_copy_outputs(rows: List[Dict[str, Any]]) -> None:
     CLEAN_COPY_TXT_PATH.write_text("\n".join(clean).strip() + "\n", encoding="utf-8-sig")
 
 
-def _upload_and_send_to_slack(done_rows: List[Dict[str, Any]]) -> None:
-    # ── Google Drive 初期化 ──────────────────────────────────────────────────
-    try:
-        from drive_uploader import create_run_folder, is_configured, upload_folder_and_get_link
-        drive_enabled = bool(is_configured and is_configured())
-    except Exception as e:
-        logging.warning("drive_uploader のインポートに失敗: %s", e)
-        drive_enabled = False
-        create_run_folder = None
-        upload_folder_and_get_link = None
+LINE_PROPERTIES_PATH = Path("assets/line_properties.json")
 
-    if drive_enabled:
-        logging.info("[Drive] 有効: Google Driveアップロードを開始します")
-        drive_parent = create_run_folder(f"post_output_{datetime.now().strftime('%Y%m%d_%H%M%S')}") if create_run_folder else None
-        if drive_parent:
-            logging.info("[Drive] 実行フォルダ作成: folder_id=%s", drive_parent)
-        else:
-            logging.warning("[Drive] 実行フォルダの作成に失敗しました。物件ごとに直接アップロードします")
-    else:
-        drive_parent = None
-        logging.warning("[Drive] 無効: GOOGLE_DRIVE_CREDENTIALS_JSON が未設定または認証ファイルが見つかりません")
 
-    # ── Slack クライアント初期化 ─────────────────────────────────────────────
-    slack_client = None
-    slack_token = os.getenv("SLACK_BOT_TOKEN", "").strip()
-    slack_channel = os.getenv("SLACK_CHANNEL", "").strip()
-    if slack_token and slack_channel:
+def _save_line_properties(done_rows: List[Dict[str, Any]]) -> None:
+    """LINE Bot が参照する物件データを assets/line_properties.json に保存"""
+    existing: Dict[str, Any] = {}
+    if LINE_PROPERTIES_PATH.exists():
         try:
-            from slack_sdk import WebClient
-            slack_client = WebClient(token=slack_token)
-            logging.info("[Slack] 通知クライアント初期化OK: channel=%s", slack_channel)
-        except Exception as e:
-            logging.warning("[Slack] クライアント初期化に失敗: %s", e)
-    else:
-        logging.warning("[Slack] 通知スキップ: SLACK_BOT_TOKEN または SLACK_CHANNEL が未設定")
-
-    # ── 物件ごとにアップロード & 通知 ────────────────────────────────────────
+            existing = json.loads(LINE_PROPERTIES_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
     for row in done_rows:
-        slug = str(row.get("slug") or "").strip()
         prop_num = str(row.get("property_number") or "")
-        if not slug:
+        if not prop_num:
             continue
-        folder = ADOPTED_FOLDER / slug
-        if not folder.is_dir():
-            logging.warning("[%s] 採用フォルダが見つかりません: %s", slug, folder)
+        existing[prop_num] = {
+            "property_number": prop_num,
+            "slug":       str(row.get("slug")       or ""),
+            "title":      str(row.get("title")      or ""),
+            "caption":    str(row.get("caption")    or ""),
+            "price":      str(row.get("price")      or ""),
+            "layout":     str(row.get("layout")     or ""),
+            "station":    str(row.get("station")    or ""),
+            "features":   list(row.get("features")  or []),
+            "detail_url": str(row.get("detail_url") or ""),
+            "posted_at":  existing.get(prop_num, {}).get("posted_at"),
+        }
+    LINE_PROPERTIES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LINE_PROPERTIES_PATH.write_text(
+        json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    logging.info("[LINE] 物件データ保存: %s (%d件)", LINE_PROPERTIES_PATH, len(done_rows))
+
+    # Google Apps Script に物件データを送信（GAS が参照するため）
+    gas_url = os.getenv("GAS_WEBHOOK_URL", "").strip()
+    gas_secret = os.getenv("GAS_UPDATE_SECRET", "").strip()
+    if gas_url and gas_secret:
+        try:
+            import urllib.request as _urllib_req
+            payload = json.dumps({
+                "type": "update_properties",
+                "secret": gas_secret,
+                "data": existing,
+            }, ensure_ascii=False).encode("utf-8")
+            req = _urllib_req.Request(
+                gas_url, data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with _urllib_req.urlopen(req, timeout=10) as resp:
+                logging.info("[LINE] GAS へ物件データ送信完了: %s", resp.read().decode())
+        except Exception as e:
+            logging.warning("[LINE] GAS 送信失敗（スキップ）: %s", e)
+    else:
+        logging.info("[LINE] GAS_WEBHOOK_URL 未設定のため GAS 送信をスキップ")
+
+
+def _upload_and_send_to_slack(done_rows: List[Dict[str, Any]]) -> None:
+    slack_token   = os.getenv("SLACK_BOT_TOKEN", "").strip()
+    slack_channel = os.getenv("SLACK_CHANNEL",   "").strip()
+    if not slack_token or not slack_channel:
+        logging.warning("[Slack] 通知スキップ: SLACK_BOT_TOKEN または SLACK_CHANNEL が未設定")
+        return
+
+    try:
+        from slack_sdk import WebClient
+        client = WebClient(token=slack_token)
+        logging.info("[Slack] クライアント初期化OK: channel=%s", slack_channel)
+    except Exception as e:
+        logging.warning("[Slack] クライアント初期化失敗: %s", e)
+        return
+
+    # ── 物件ごとに送信 ─────────────────────────────────────────────────────
+    for i, row in enumerate(done_rows, 1):
+        slug     = str(row.get("slug")            or "")
+        prop_num = str(row.get("property_number") or str(i))
+        title    = str(row.get("title")           or "")
+        caption  = sanitize_public_caption(str(row.get("caption") or ""))
+
+        adopted_dir = ADOPTED_FOLDER / slug
+        if not adopted_dir.is_dir():
+            logging.warning("[%s] 採用フォルダが見つかりません", slug)
             continue
 
-        # Drive アップロード
-        drive_link = None
-        if drive_enabled and upload_folder_and_get_link is not None:
-            logging.info("[%s] Driveアップロード中...", slug)
-            drive_link = upload_folder_and_get_link(folder, f"{prop_num}_{slug}" if prop_num else slug, drive_parent)
-            if drive_link:
-                logging.info("[%s] Driveアップロード完了: %s", slug, drive_link)
-            else:
-                logging.warning("[%s] Driveアップロード失敗（リンクなし）", slug)
+        # 画像収集（文字入れ完成 + 全ソース画像）
+        file_uploads = []
+        overlay = adopted_dir / "04_文字入れ完成.png"
+        if overlay.exists():
+            file_uploads.append({
+                "file": str(overlay), "filename": f"00_cover_{prop_num}.png",
+                "title": f"【文字入れ】物件{prop_num}",
+            })
+        for img in sorted(p for p in adopted_dir.glob("saved_*")
+                          if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}):
+            file_uploads.append({"file": str(img), "filename": img.name, "title": img.stem})
 
-        # Slack 通知
-        if slack_client is not None:
-            title = str(row.get("title") or "").strip()
-            caption = sanitize_public_caption(str(row.get("caption") or "").strip())
-            num_label = f"物件番号: {prop_num}" if prop_num else ""
-            parts = []
-            if num_label:
-                parts.append(num_label)
-            if title:
-                parts.append(f"【タイトル】\n{title}")
-            if drive_link:
-                parts.append(f"【Driveリンク】\n{drive_link}")
-            if caption:
-                parts.append(f"【キャプション】\n{caption}")
-            if parts:
-                try:
-                    slack_client.chat_postMessage(channel=slack_channel, text="\n\n".join(parts))
-                    logging.info("[%s] Slack通知送信完了", slug)
-                except Exception as e:
-                    logging.warning("[%s] Slack通知送信失敗: %s", slug, e)
+        if not file_uploads:
+            logging.warning("[%s] 送信する画像がありません", slug)
+            continue
+
+        # ── メッセージ①: 物件番号 + タイトル（コピペ用）────────────────
+        prop_id_msg = f"物件{prop_num}　{title}" if title else f"物件{prop_num}"
+        try:
+            client.chat_postMessage(channel=slack_channel, text=prop_id_msg, mrkdwn=False)
+        except Exception as e:
+            logging.warning("[%s] 物件番号メッセージ送信失敗: %s", slug, e)
+
+        # ── メッセージ②: タイトルのみ（コピペ用）────────────────────────
+        if title:
+            try:
+                client.chat_postMessage(channel=slack_channel, text=title, mrkdwn=False)
+            except Exception as e:
+                logging.warning("[%s] タイトル送信失敗: %s", slug, e)
+
+        # ── メッセージ③: キャプションのみ（コピペ用）────────────────────
+        if caption:
+            try:
+                client.chat_postMessage(channel=slack_channel, text=caption, mrkdwn=False)
+            except Exception as e:
+                logging.warning("[%s] キャプション送信失敗: %s", slug, e)
+
+        # ── メッセージ④: 投稿完了ボタン（スレッドのアンカー）────────────
+        thread_ts = None
+        try:
+            resp = client.chat_postMessage(
+                channel=slack_channel,
+                text=f"物件{prop_num} — 画像{len(file_uploads)}枚をスレッドに送信済み",
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": (
+                                f"📷 *物件{prop_num}* — 全{len(file_uploads)}枚\n"
+                                f"画像はこのメッセージのスレッドにあります\n"
+                                f"Instagramに投稿したら下のボタンを押してください"
+                            ),
+                        },
+                    },
+                    {
+                        "type": "actions",
+                        "block_id": f"posted_{prop_num}",
+                        "elements": [{
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "✅ 投稿完了"},
+                            "style": "primary",
+                            "value": f"posted:{prop_num}:{slug}",
+                            "action_id": f"mark_posted_{prop_num}",
+                        }],
+                    },
+                ],
+            )
+            thread_ts = resp.get("ts")
+            logging.info("[%s] ボタンメッセージ送信完了 (ts=%s)", slug, thread_ts)
+        except Exception as e:
+            logging.warning("[%s] ボタンメッセージ送信失敗: %s", slug, e)
+
+        # ── スレッドに全画像を送信（10枚ずつ）────────────────────────────
+        BATCH = 10
+        batches = [file_uploads[j:j + BATCH] for j in range(0, len(file_uploads), BATCH)]
+        for b_i, batch in enumerate(batches):
+            try:
+                kwargs: Dict[str, Any] = {"channel": slack_channel, "file_uploads": batch}
+                if thread_ts:
+                    kwargs["thread_ts"] = thread_ts
+                client.files_upload_v2(**kwargs)
+                logging.info("[%s] 画像バッチ %d/%d (%d枚) アップロード完了",
+                             slug, b_i + 1, len(batches), len(batch))
+            except Exception as e:
+                logging.warning("[%s] 画像バッチ %d アップロード失敗: %s", slug, b_i + 1, e)
 
 
 def main() -> None:
@@ -703,6 +1113,12 @@ def main() -> None:
             row = _save_property_outputs(rec, src, copy_payload)
             row["selected_index"] = chosen
             row["property_number"] = prop_num
+            # LINE Bot 用に物件データを追加
+            row["price"]      = str(rec.get("price")    or "")
+            row["layout"]     = str(rec.get("layout")   or "")
+            row["station"]    = str(rec.get("station")  or "")
+            row["features"]   = list(rec.get("features") or [])
+            row["detail_url"] = str(rec.get("detail_url") or "")
             done_rows.append(row)
             logging.info("[%s] 処理完了 (物件番号=%s)", rid, prop_num)
         except Exception as e:
@@ -715,6 +1131,7 @@ def main() -> None:
 
     if done_rows:
         write_copy_outputs(done_rows)
+        _save_line_properties(done_rows)
         _upload_and_send_to_slack(done_rows)
 
     for f in failed:

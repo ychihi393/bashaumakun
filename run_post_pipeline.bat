@@ -31,19 +31,16 @@ if errorlevel 1 (
   goto :fail
 )
 
-echo [OK] Post image generation finished.
-echo [Output] See Python logs above for exact saved file paths.
-if "%KEEP_WINDOW%"=="1" (
-  echo.
-  echo Finished. Press any key to close this window.
-  pause >nul
-)
+echo.
+echo [OK] 画像生成が完了しました。
+echo [出力先] output\投稿用出力\採用\  以下に各物件フォルダが作成されています。
+echo.
+pause
 exit /b 0
 
 :fail
-if "%KEEP_WINDOW%"=="1" (
-  echo.
-  echo Failed. Check logs above, then press any key.
-  pause >nul
-)
+echo.
+echo [ERROR] 処理に失敗しました。上のログを確認してください。
+echo.
+pause
 exit /b 1

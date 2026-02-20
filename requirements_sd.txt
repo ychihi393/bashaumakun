@@ -1,0 +1,7 @@
+# Stable Diffusion アウトペインティング用
+# pip install -r requirements_sd.txt
+
+torch>=2.1.0
+diffusers>=0.27.0
+transformers>=4.37.0
+accelerate>=0.27.0

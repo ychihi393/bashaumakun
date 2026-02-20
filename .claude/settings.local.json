@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir:*)",
+      "Bash(cmd /c \"dir C:\\\\Users\\\\yamag\\\\投稿自動化\")",
+      "Bash(powershell -Command \"Get-ChildItem ''C:\\\\Users\\\\yamag\\\\投稿自動化'' | Format-List Name, Length, LastWriteTime\")",
+      "Bash(powershell -Command:*)",
+      "Bash(pip install:*)",
+      "Bash(python -m pip install:*)",
+      "Bash(python -c:*)",
+      "Bash(git init:*)",
+      "Bash(git remote add:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(python test_flow.py:*)",
+      "Bash(python -X utf8 test_flow.py:*)",
+      "Bash(python3:*)",
+      "Bash(del \"C:\\\\Users\\\\yamag\\\\投稿自動化\\\\test_overlay.png\" \"C:\\\\Users\\\\yamag\\\\投稿自動化\\\\test_catalog.png\")",
+      "Bash(python -X utf8:*)",
+      "Bash(findstr:*)",
+      "Bash(ngrok version:*)",
+      "Bash(winget install:*)",
+      "Bash(C:/Users/yamag/AppData/Local/Microsoft/WinGet/Links/ngrok.exe version)",
+      "Bash(cmd /c \"where ngrok\")",
+      "Bash(\"C:\\\\Users\\\\yamag\\\\AppData\\\\Local\\\\Microsoft\\\\WinGet\\\\Packages\\\\Ngrok.Ngrok_Microsoft.Winget.Source_8wekyb3d8bbwe\\\\ngrok.exe\" version)",
+      "Bash(\"C:\\\\Users\\\\yamag\\\\AppData\\\\Local\\\\Microsoft\\\\WinGet\\\\Packages\\\\Ngrok.Ngrok_Microsoft.Winget.Source_8wekyb3d8bbwe\\\\ngrok.exe\" config add-authtoken 39vQ23sRRfF6M2Y3MGCXQVoYT3G_6FFwAj5qKTw2uZePymkrF)",
+      "Bash(curl:*)",
+      "Bash(\"C:\\\\Users\\\\yamag\\\\AppData\\\\Local\\\\Microsoft\\\\WinGet\\\\Packages\\\\Ngrok.Ngrok_Microsoft.Winget.Source_8wekyb3d8bbwe\\\\ngrok.exe\" update)",
+      "Bash(ls:*)",
+      "WebSearch"
+    ]
+  }
+}

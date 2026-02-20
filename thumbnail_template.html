@@ -1,0 +1,124 @@
+﻿<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=1080, initial-scale=1.0" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@700;900&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --w: 1080px;
+      --h: 1350px;
+      --safe-right: 170px;
+      --safe-bottom: 250px;
+      --safe-left: 56px;
+      --safe-top: 48px;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      width: var(--w);
+      height: var(--h);
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      font-family: "Noto Sans JP", "Hiragino Kaku Gothic ProN", "Yu Gothic", sans-serif;
+      background: #111;
+    }
+
+    .canvas {
+      position: relative;
+      width: var(--w);
+      height: var(--h);
+      background-image:
+        linear-gradient(to top, rgba(0,0,0,0.55) 0%, rgba(0,0,0,0.0) 45%, rgba(0,0,0,0.12) 100%),
+        url("{{ background_image }}");
+      background-size: cover;
+      background-position: center;
+      background-repeat: no-repeat;
+      isolation: isolate;
+    }
+
+    .safe {
+      position: absolute;
+      inset: var(--safe-top) var(--safe-right) var(--safe-bottom) var(--safe-left);
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-start;
+      gap: 18px;
+    }
+
+    .price {
+      display: inline-block;
+      max-width: 100%;
+      font-size: 150px;
+      line-height: 1;
+      font-weight: 900;
+      color: #FF0000;
+      letter-spacing: -0.02em;
+      -webkit-text-stroke: 10px #ffffff;
+      text-shadow:
+        0 12px 20px rgba(0,0,0,0.42),
+        0 0 2px rgba(255,255,255,0.6);
+      paint-order: stroke fill;
+      word-break: keep-all;
+    }
+
+    .headline {
+      font-size: 76px;
+      line-height: 1.1;
+      font-weight: 900;
+      color: #ffffff;
+      -webkit-text-stroke: 7px rgba(0,0,0,0.92);
+      text-shadow: 0 8px 16px rgba(0,0,0,0.5);
+      paint-order: stroke fill;
+      word-break: keep-all;
+    }
+
+    .sub {
+      font-size: 54px;
+      line-height: 1.1;
+      font-weight: 900;
+      color: #ffffff;
+      -webkit-text-stroke: 5px rgba(0,0,0,0.88);
+      text-shadow: 0 7px 14px rgba(0,0,0,0.45);
+      paint-order: stroke fill;
+    }
+
+    .badges {
+      display: flex;
+      gap: 14px;
+      flex-wrap: wrap;
+      margin-top: 6px;
+    }
+
+    .badge {
+      font-size: 36px;
+      font-weight: 700;
+      color: #fff;
+      background: rgba(0, 0, 0, 0.56);
+      border: 2px solid rgba(255,255,255,0.75);
+      border-radius: 999px;
+      padding: 10px 24px;
+      line-height: 1;
+      backdrop-filter: blur(3px);
+    }
+  </style>
+</head>
+<body>
+  <div class="canvas">
+    <div class="safe">
+      <div class="price">{{ price }}</div>
+      <div class="headline">{{ headline }}</div>
+      <div class="sub">{{ station }}</div>
+      <div class="badges">
+        {% for feature in features %}
+          <span class="badge">{{ feature }}</span>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+</body>
+</html>
